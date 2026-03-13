@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import tempfile
+import time
 import urllib.parse
 from pathlib import Path
 from typing import Any
@@ -27,14 +28,18 @@ class MatrixChannel(Channel):
         - ``allowed_rooms``: (optional) List of room IDs to listen to. Empty = all rooms.
         - ``allowed_users``: (optional) List of user IDs allowed to interact. Empty = all users.
         - ``store_path``: (optional) Path to store encryption keys and session data.
+        - ``typing_enabled``: (optional) Enable typing notifications (default: True).
+        - ``reactions_enabled``: (optional) Enable emoji reactions (default: True).
 
     The channel connects to the Matrix homeserver and listens for messages
     in rooms where the bot is joined.
 
     Message flow:
         1. User sends a message in a Matrix room
-        2. Bot processes the message through the DeerFlow agent
-        3. Bot replies in the same room/thread
+        2. Bot sends typing notification and adds reaction
+        3. Bot processes the message through the DeerFlow agent
+        4. Bot replies in the same room/thread
+        5. Bot updates reaction to indicate completion
     """
 
     def __init__(self, bus: MessageBus, config: dict[str, Any]) -> None:
@@ -45,6 +50,12 @@ class MatrixChannel(Channel):
         self._allowed_rooms: set[str] = set(config.get("allowed_rooms", []))
         self._allowed_users: set[str] = set(config.get("allowed_users", []))
         self._store_path = config.get("store_path")
+        self._typing_enabled = config.get("typing_enabled", True)
+        self._reactions_enabled = config.get("reactions_enabled", True)
+        # Track active typing tasks for cancellation
+        self._typing_tasks: dict[str, asyncio.Task] = {}
+        # Track streaming message event_ids: chat_id -> event_id
+        self._streaming_messages: dict[str, str] = {}
 
     async def start(self) -> None:
         if self._running:
@@ -99,7 +110,10 @@ class MatrixChannel(Channel):
         try:
             if access_token:
                 self._client.access_token = access_token
-                logger.info("[Matrix] using provided access token")
+                # IMPORTANT: When using access_token directly, user_id must be set manually
+                # because nio doesn't set it from the constructor when access_token is provided later
+                self._client.user_id = user_id
+                logger.info("[Matrix] using provided access token for user %s", user_id)
             else:
                 response = await self._client.login(password=password, device_name=device_id)
                 if isinstance(response, LoginResponse):
@@ -118,13 +132,26 @@ class MatrixChannel(Channel):
         except Exception:
             logger.info("[Matrix] no existing encryption store, will create new one")
 
-        # Set up event callback
+        # CRITICAL: Perform initial sync BEFORE registering event callbacks
+        # This ensures we get the next_batch token without triggering callbacks
+        # on any historical messages that might be in the sync response
+        await self._initial_sync()
+
+        # NOW register event callbacks - they will only receive new events
+        # since we already have the next_batch token from initial sync
         self._client.add_event_callback(self._on_room_message, self._get_room_message_event_class())
 
-        self._running = True
-        self.bus.subscribe_outbound(self._on_outbound)
+        # Set up event callback for encrypted events that failed to decrypt
+        # Note: nio uses MegolmEvent for undecryptable events, RoomEncryptionEvent for encryption state changes
+        from nio import MegolmEvent
+        self._client.add_event_callback(self._on_room_encrypted_event, MegolmEvent)
 
-        # Start sync in background
+        self._running = True
+        self._start_time = time.time()  # Record when the bot started (after initial sync)
+        self.bus.subscribe_outbound(self._on_outbound)
+        self.bus.subscribe_stream_update(self._on_stream_update)  # For streaming responses
+
+        # Start sync in background - will use next_batch from initial sync
         self._sync_task = asyncio.create_task(self._run_sync())
         logger.info("Matrix channel started (homeserver=%s, user=%s)", homeserver, user_id)
 
@@ -134,11 +161,43 @@ class MatrixChannel(Channel):
 
         return RoomMessage
 
-    async def _run_sync(self) -> None:
-        """Run the Matrix sync loop."""
+    async def _initial_sync(self) -> None:
+        """Perform initial sync to get current position without processing events.
+
+        This is called once at startup to get the next_batch token.
+        After this, only new messages will be received.
+        """
         try:
-            # First sync to get initial state
-            await self._client.sync_forever(timeout=30000, full_state=True)
+            # Use a filter that excludes timeline events to speed up initial sync
+            # and avoid receiving historical messages
+            sync_filter = {
+                "room": {
+                    "timeline": {"limit": 0},  # Don't fetch any timeline events
+                    "state": {"lazy_load_members": True},
+                },
+                "account_data": {"not_types": ["*"]},  # Exclude account data
+                "presence": {"not_types": ["*"]},  # Exclude presence
+            }
+            response = await self._client.sync(
+                timeout=30000,
+                full_state=True,
+                sync_filter=sync_filter,
+            )
+            # The client stores the next_batch token internally
+            logger.info("[Matrix] initial sync completed, next_batch=%s", self._client.next_batch)
+        except Exception:
+            logger.exception("[Matrix] initial sync error")
+            raise
+
+    async def _run_sync(self) -> None:
+        """Run the Matrix sync loop.
+
+        Uses the next_batch token from initial sync to only receive new events.
+        """
+        try:
+            # sync_forever will use the stored next_batch token,
+            # so it will only receive events after the initial sync
+            await self._client.sync_forever(timeout=30000)
         except asyncio.CancelledError:
             logger.info("[Matrix] sync loop cancelled")
         except Exception:
@@ -148,6 +207,7 @@ class MatrixChannel(Channel):
     async def stop(self) -> None:
         self._running = False
         self.bus.unsubscribe_outbound(self._on_outbound)
+        self.bus.unsubscribe_stream_update(self._on_stream_update)  # Remove streaming callback
 
         if hasattr(self, "_sync_task"):
             self._sync_task.cancel()
@@ -168,13 +228,17 @@ class MatrixChannel(Channel):
             return
 
         logger.info(
-            "[Matrix] sending reply: room_id=%s, text_len=%d",
+            "[Matrix] sending reply: room_id=%s, text_len=%d, thread_ts=%s",
             msg.chat_id,
             len(msg.text),
+            msg.thread_ts,
         )
 
         try:
             from nio import RoomSendResponse
+
+            # Stop typing notification for this room
+            await self._stop_typing(msg.chat_id)
 
             # Send message to room
             content = {
@@ -185,6 +249,7 @@ class MatrixChannel(Channel):
             }
 
             # If replying to a specific message (thread_ts is the event_id)
+            # Use m.in_reply_to for simple replies, m.thread for thread support
             if msg.thread_ts:
                 content["m.relates_to"] = {
                     "m.in_reply_to": {"event_id": msg.thread_ts}
@@ -199,11 +264,22 @@ class MatrixChannel(Channel):
 
             if isinstance(response, RoomSendResponse):
                 logger.info("[Matrix] message sent successfully: event_id=%s", response.event_id)
+
+                # Track event_id for streaming messages
+                if not msg.is_final:
+                    self._streaming_messages[msg.chat_id] = response.event_id
+                    logger.debug("[Matrix] tracking streaming message: chat=%s, event=%s", msg.chat_id, response.event_id)
+
+                # Send "check mark" reaction to original message to indicate completion
+                if msg.thread_ts and msg.is_final:
+                    await self._send_reaction(msg.chat_id, msg.thread_ts, "✅")
             else:
                 logger.warning("[Matrix] failed to send message: %s", response)
 
         except Exception:
             logger.exception("[Matrix] error sending message")
+            # Ensure typing is stopped on error
+            await self._stop_typing(msg.chat_id)
 
     async def send_file(self, msg: OutboundMessage, attachment: ResolvedAttachment) -> bool:
         if not self._client:
@@ -235,27 +311,24 @@ class MatrixChannel(Channel):
             mxc_uri = response.content_uri
             logger.info("[Matrix] file uploaded: %s -> %s", attachment.filename, mxc_uri)
 
-            # Send file message
-            if attachment.is_image:
-                content = {
-                    "msgtype": "m.image",
-                    "body": attachment.filename,
-                    "url": mxc_uri,
-                    "info": {
-                        "mimetype": attachment.mime_type,
-                        "size": attachment.size,
-                    },
-                }
-            else:
-                content = {
-                    "msgtype": "m.file",
-                    "body": attachment.filename,
-                    "url": mxc_uri,
-                    "info": {
-                        "mimetype": attachment.mime_type,
-                        "size": attachment.size,
-                    },
-                }
+            # Send file message - determine msgtype based on MIME type
+            msgtype = "m.file"
+            if attachment.mime_type.startswith("image/"):
+                msgtype = "m.image"
+            elif attachment.mime_type.startswith("audio/"):
+                msgtype = "m.audio"
+            elif attachment.mime_type.startswith("video/"):
+                msgtype = "m.video"
+
+            content = {
+                "msgtype": msgtype,
+                "body": attachment.filename,
+                "url": mxc_uri,
+                "info": {
+                    "mimetype": attachment.mime_type,
+                    "size": attachment.size,
+                },
+            }
 
             # Add reply relation if needed
             if msg.thread_ts:
@@ -282,13 +355,96 @@ class MatrixChannel(Channel):
             logger.exception("[Matrix] error uploading/sending file: %s", attachment.filename)
             return False
 
+    async def _on_room_encrypted_event(self, room, event) -> None:
+        """Called when an encrypted event cannot be decrypted.
+
+        This can happen when:
+        - The bot hasn't received the room key yet
+        - The sender's device is not verified
+        - The message was sent before the bot joined the room
+
+        We log a warning and optionally request the room key.
+        """
+        logger.warning(
+            "[Matrix] failed to decrypt message in room %s from %s (event_id=%s)",
+            room.room_id,
+            event.sender,
+            event.event_id,
+        )
+
+        # Skip messages from ourselves
+        if event.sender == self._client.user_id:
+            return
+
+        # Check room allowlist
+        if self._allowed_rooms and room.room_id not in self._allowed_rooms:
+            return
+
+        # Check user allowlist
+        if self._allowed_users and event.sender not in self._allowed_users:
+            return
+
+        # Safety check: Skip historical messages (sent before the bot started)
+        # This should not happen after initial sync, but we keep it as a safeguard
+        if hasattr(event, 'server_timestamp') and event.server_timestamp:
+            event_timestamp = event.server_timestamp / 1000  # Convert ms to seconds
+            if event_timestamp < self._start_time:
+                logger.info(
+                    "[Matrix] skipping historical encrypted message: event_ts=%.2f, bot_start=%.2f, sender=%s",
+                    event_timestamp,
+                    self._start_time,
+                    event.sender,
+                )
+                return
+
+        # Request the room key to try to decrypt future messages
+        try:
+            await self._client.request_room_key(event.session_id, event.sender_key, room.room_id)
+            logger.info("[Matrix] requested room key for session %s", event.session_id)
+        except Exception:
+            logger.exception("[Matrix] failed to request room key")
+
+        # Send a notice to the user about decryption failure
+        inbound = self._make_inbound(
+            chat_id=room.room_id,
+            user_id=event.sender,
+            text="[无法解密此消息，请确保已验证设备或重新发送消息]",
+            msg_type=InboundMessageType.CHAT,
+            thread_ts=event.event_id,
+            metadata={
+                "event_id": event.event_id,
+                "room_name": room.display_name,
+                "decryption_failed": True,
+            },
+        )
+        inbound.topic_id = room.room_id
+        await self.bus.publish_inbound(inbound)
+
     async def _on_room_message(self, room, event) -> None:
         """Called when a room message is received."""
         try:
-            from nio import RoomMessageText, RoomMessageImage, RoomMessageFile, RoomMessageAudio, RoomMessageMedia
+            from nio import RoomMessageText, RoomMessageImage, RoomMessageFile, RoomMessageAudio, RoomMessageVideo
 
-            # Skip messages from ourselves
-            if event.sender == self._client.user_id:
+            # Log all incoming events for debugging
+            event_ts = event.server_timestamp / 1000 if hasattr(event, 'server_timestamp') and event.server_timestamp else 0
+            logger.info(
+                "[Matrix] received event: room=%s, sender=%s, type=%s, event_ts=%.2f, bot_start=%.2f, age=%.1fs, bot_user_id=%s",
+                room.room_id,
+                event.sender,
+                type(event).__name__,
+                event_ts,
+                self._start_time,
+                time.time() - event_ts if event_ts > 0 else 0,
+                self._client.user_id,
+            )
+
+            # Skip messages from ourselves (compare case-insensitively)
+            # Matrix user IDs are case-sensitive but some servers normalize them
+            sender_lower = event.sender.lower() if event.sender else ""
+            user_id_lower = self._client.user_id.lower() if self._client.user_id else ""
+            logger.info("[Matrix] checking own message: sender_lower=%s, user_id_lower=%s, match=%s", sender_lower, user_id_lower, sender_lower == user_id_lower)
+            if sender_lower and user_id_lower and sender_lower == user_id_lower:
+                logger.info("[Matrix] skipping own message")
                 return
 
             # Check room allowlist
@@ -299,6 +455,16 @@ class MatrixChannel(Channel):
             # Check user allowlist
             if self._allowed_users and event.sender not in self._allowed_users:
                 logger.debug("[Matrix] ignoring message from unallowed user: %s", event.sender)
+                return
+
+            # Safety check: Skip historical messages (sent before the bot started)
+            # This should not happen after initial sync, but we keep it as a safeguard
+            if event_ts > 0 and event_ts < self._start_time:
+                logger.info(
+                    "[Matrix] skipping historical message: event_ts=%.2f < bot_start=%.2f",
+                    event_ts,
+                    self._start_time,
+                )
                 return
 
             # Extract message content
@@ -351,19 +517,19 @@ class MatrixChannel(Channel):
                     })
                 else:
                     text = "[用户发送了一个音频，但下载失败]"
-            elif isinstance(event, RoomMessageMedia):
-                text = f"[用户发送了一个媒体文件: {event.body}]"
+            elif isinstance(event, RoomMessageVideo):
+                text = f"[用户发送了一个视频: {event.body}]"
                 msg_type = InboundMessageType.CHAT
-                # Download media
-                file_path = await self._download_matrix_media(event.url, event.body or "media")
+                # Download video
+                file_path = await self._download_matrix_media(event.url, event.body or "video")
                 if file_path:
                     files.append({
-                        "type": "media",
+                        "type": "video",
                         "path": str(file_path),
-                        "filename": event.body or "media",
+                        "filename": event.body or "video",
                     })
                 else:
-                    text = "[用户发送了一个媒体文件，但下载失败]"
+                    text = "[用户发送了一个视频，但下载失败]"
             else:
                 # Unknown message type
                 logger.debug("[Matrix] ignoring unknown message type: %s", type(event).__name__)
@@ -382,6 +548,22 @@ class MatrixChannel(Channel):
                 len(files),
             )
 
+            # Send typing notification and reaction to indicate processing
+            # Start typing notification (will be stopped when response is sent)
+            await self._start_typing(room.room_id)
+            # Add "eyes" reaction to indicate message received
+            await self._send_reaction(room.room_id, event.event_id, "👀")
+
+            # Extract thread root from event relations (MSC3440 threading support)
+            # If the message is part of a thread, use the thread root as topic_id
+            # This enables token caching for conversations within the same thread
+            thread_root_id: str | None = None
+            if hasattr(event, 'source') and isinstance(event.source, dict):
+                relates_to = event.source.get('content', {}).get('m.relates_to', {})
+                if relates_to.get('rel_type') == 'm.thread':
+                    thread_root_id = relates_to.get('event_id')
+                    logger.info("[Matrix] message is in thread, thread_root=%s", thread_root_id)
+
             # Create inbound message
             inbound = self._make_inbound(
                 chat_id=room.room_id,
@@ -393,11 +575,15 @@ class MatrixChannel(Channel):
                 metadata={
                     "event_id": event.event_id,
                     "room_name": room.display_name,
+                    "thread_root_id": thread_root_id,
                 },
             )
 
-            # Get topic_id from room ID (each room is a separate conversation)
-            inbound.topic_id = room.room_id
+            # topic_id determines DeerFlow thread mapping:
+            # - If message is in a Matrix thread (MSC3440), use thread_root_id
+            # - Otherwise, use room_id (each room = one conversation)
+            # This enables token caching for conversations in the same Matrix thread
+            inbound.topic_id = thread_root_id or room.room_id
 
             await self.bus.publish_inbound(inbound)
 
@@ -405,7 +591,9 @@ class MatrixChannel(Channel):
             logger.exception("[Matrix] error processing message")
 
     async def _download_matrix_media(self, mxc_uri: str, filename: str) -> Path | None:
-        """Download media from Matrix server.
+        """Download media from Matrix server, with automatic decryption for encrypted rooms.
+
+        Uses nio's download_mxc() which handles encrypted media transparently.
 
         Args:
             mxc_uri: Matrix content URI (e.g., "mxc://matrix.org/abc123")
@@ -418,26 +606,13 @@ class MatrixChannel(Channel):
             return None
 
         try:
-            import httpx
+            from nio import DownloadResponse
 
-            # Parse mxc:// URI
-            parsed = urllib.parse.urlparse(mxc_uri)
-            if parsed.scheme != "mxc":
-                logger.warning("[Matrix] invalid mxc URI: %s", mxc_uri)
-                return None
+            # Use nio's download_mxc for automatic decryption support
+            response = await self._client.download_mxc(mxc_uri)
 
-            # Build download URL
-            server_name = parsed.netloc
-            media_id = parsed.path.lstrip("/")
-            download_url = f"{self._client.homeserver}/_matrix/media/v3/download/{server_name}/{media_id}"
-
-            # Download with access token
-            headers = {"Authorization": f"Bearer {self._client.access_token}"}
-            async with httpx.AsyncClient(timeout=60) as client:
-                response = await client.get(download_url, headers=headers)
-
-            if response.status_code != 200:
-                logger.error("[Matrix] failed to download media %s: status=%s", mxc_uri, response.status_code)
+            if not isinstance(response, DownloadResponse):
+                logger.warning("[Matrix] failed to download media %s: %s", mxc_uri, response)
                 return None
 
             # Save to temp directory
@@ -445,13 +620,13 @@ class MatrixChannel(Channel):
             temp_dir.mkdir(parents=True, exist_ok=True)
 
             # Sanitize filename
-            safe_filename = Path(filename).name if filename else media_id
+            safe_filename = Path(filename).name if filename else mxc_uri.split("/")[-1]
             file_path = temp_dir / safe_filename
 
             with open(file_path, "wb") as f:
-                f.write(response.content)
+                f.write(response.body)
 
-            logger.info("[Matrix] downloaded media: %s -> %s (%d bytes)", mxc_uri, file_path, len(response.content))
+            logger.info("[Matrix] downloaded media: %s -> %s (%d bytes)", mxc_uri, file_path, len(response.body))
             return file_path
 
         except Exception:
@@ -490,3 +665,254 @@ class MatrixChannel(Channel):
         text = f"<p>{text}</p>"
 
         return text
+
+    # -- typing notification helpers ---------------------------------------
+
+    async def _send_typing_notification(self, room_id: str, typing: bool = True, timeout: int = 30000) -> None:
+        """Send typing notification to a Matrix room.
+
+        This tells other users in the room that the bot is typing.
+        The notification expires after `timeout` milliseconds.
+
+        Args:
+            room_id: The Matrix room ID.
+            typing: True to show typing, False to clear typing state.
+            timeout: Duration in milliseconds for the typing notification (default: 30s).
+        """
+        if not self._client or not self._typing_enabled:
+            return
+
+        try:
+            import httpx
+
+            # Build the typing API URL
+            # PUT /_matrix/client/v3/rooms/{roomId}/typing/{userId}
+            url = f"{self._client.homeserver}/_matrix/client/v3/rooms/{urllib.parse.quote(room_id)}/typing/{urllib.parse.quote(self._client.user_id)}"
+
+            # Build request body
+            body = {"typing": typing}
+            if typing:
+                body["timeout"] = timeout
+
+            async with httpx.AsyncClient() as http:
+                response = await http.put(
+                    url,
+                    json=body,
+                    headers={
+                        "Authorization": f"Bearer {self._client.access_token}",
+                        "Content-Type": "application/json",
+                    },
+                    timeout=10.0,
+                )
+
+                if response.status_code == 200:
+                    logger.debug("[Matrix] typing notification sent: room=%s, typing=%s", room_id, typing)
+                else:
+                    logger.warning(
+                        "[Matrix] typing notification failed: status=%d, body=%s",
+                        response.status_code,
+                        response.text[:200],
+                    )
+
+        except Exception:
+            logger.exception("[Matrix] failed to send typing notification")
+
+    async def _start_typing(self, room_id: str) -> None:
+        """Start sending periodic typing notifications.
+
+        Typing notifications expire after 30 seconds, so we need to
+        periodically resend them until the response is ready.
+        """
+        # Cancel any existing typing task for this room
+        if room_id in self._typing_tasks:
+            self._typing_tasks[room_id].cancel()
+
+        async def _typing_loop():
+            try:
+                while self._running:
+                    await self._send_typing_notification(room_id, typing=True, timeout=30000)
+                    await asyncio.sleep(25)  # Resend every 25 seconds (before 30s timeout)
+            except asyncio.CancelledError:
+                # Stop typing when cancelled
+                await self._send_typing_notification(room_id, typing=False)
+                raise
+            except Exception:
+                logger.exception("[Matrix] typing loop error")
+
+        self._typing_tasks[room_id] = asyncio.create_task(_typing_loop())
+
+    async def _stop_typing(self, room_id: str) -> None:
+        """Stop typing notification for a room."""
+        if room_id in self._typing_tasks:
+            self._typing_tasks[room_id].cancel()
+            try:
+                await self._typing_tasks[room_id]
+            except asyncio.CancelledError:
+                pass
+            del self._typing_tasks[room_id]
+
+        # Send final typing=false
+        await self._send_typing_notification(room_id, typing=False)
+
+    # -- reaction helpers ---------------------------------------------------
+
+    async def _send_reaction(self, room_id: str, event_id: str, emoji: str) -> None:
+        """Send an emoji reaction to a message.
+
+        Args:
+            room_id: The Matrix room ID.
+            event_id: The event ID to react to.
+            emoji: The emoji to react with (e.g., "✅", "👀").
+        """
+        if not self._client or not self._reactions_enabled:
+            return
+
+        try:
+            from nio import RoomSendResponse
+
+            # Reactions are sent as m.reaction events with a relates_to
+            content = {
+                "m.relates_to": {
+                    "rel_type": "m.annotation",
+                    "event_id": event_id,
+                    "key": emoji,
+                }
+            }
+
+            response = await self._client.room_send(
+                room_id=room_id,
+                message_type="m.reaction",
+                content=content,
+                ignore_unverified_devices=True,
+            )
+
+            if isinstance(response, RoomSendResponse):
+                logger.info("[Matrix] reaction '%s' sent to event %s", emoji, event_id)
+            else:
+                logger.warning("[Matrix] failed to send reaction: %s", response)
+
+        except Exception:
+            logger.exception("[Matrix] failed to send reaction")
+
+    async def _redact_reaction(self, room_id: str, reaction_event_id: str, reason: str = "") -> None:
+        """Redact (remove) a reaction.
+
+        Args:
+            room_id: The Matrix room ID.
+            reaction_event_id: The event ID of the reaction to remove.
+            reason: Optional reason for redaction.
+        """
+        if not self._client:
+            return
+
+        try:
+            await self._client.room_redact(
+                room_id=room_id,
+                event_id=reaction_event_id,
+                reason=reason,
+            )
+            logger.info("[Matrix] reaction redacted: %s", reaction_event_id)
+        except Exception:
+            logger.exception("[Matrix] failed to redact reaction")
+
+    # -- message editing (streaming support) --------------------------------
+
+    async def edit_message(self, room_id: str, event_id: str, new_text: str) -> str | None:
+        """Edit a previously sent message.
+
+        This is used for streaming responses where we update a single message
+        as content is generated, rather than sending multiple messages.
+
+        Args:
+            room_id: The Matrix room ID.
+            event_id: The event ID of the message to edit.
+            new_text: The new text content.
+
+        Returns:
+            The new event ID if successful, None otherwise.
+        """
+        if not self._client:
+            return None
+
+        try:
+            from nio import RoomSendResponse
+
+            # Matrix edit format: m.replace relation with m.new_content
+            content = {
+                "msgtype": "m.text",
+                "body": f"* {new_text}",  # Prefix with * to indicate edit
+                "format": "org.matrix.custom.html",
+                "formatted_body": self._markdown_to_html(new_text),
+                "m.new_content": {
+                    "msgtype": "m.text",
+                    "body": new_text,
+                    "format": "org.matrix.custom.html",
+                    "formatted_body": self._markdown_to_html(new_text),
+                },
+                "m.relates_to": {
+                    "rel_type": "m.replace",
+                    "event_id": event_id,
+                },
+            }
+
+            response = await self._client.room_send(
+                room_id=room_id,
+                message_type="m.room.message",
+                content=content,
+                ignore_unverified_devices=True,
+            )
+
+            if isinstance(response, RoomSendResponse):
+                logger.debug("[Matrix] message edited: %s -> %s", event_id, response.event_id)
+                return response.event_id
+            else:
+                logger.warning("[Matrix] failed to edit message: %s", response)
+                return None
+
+        except Exception:
+            logger.exception("[Matrix] error editing message")
+            return None
+
+    # -- streaming support --------------------------------------------------
+
+    async def _on_stream_update(self, msg: "StreamUpdateMessage") -> None:
+        """Handle streaming message updates from the dispatcher.
+
+        This is called during streaming response generation to update
+        the message content in real-time.
+
+        Args:
+            msg: The stream update message containing the new text.
+        """
+        if not self._client:
+            return
+
+        room_id = msg.chat_id
+
+        # Get the tracked event_id for this chat (set when initial message was sent)
+        event_id = self._streaming_messages.get(room_id) or msg.message_id
+
+        logger.debug(
+            "[Matrix] stream update: room=%s, event=%s, text_len=%d, is_final=%s",
+            room_id,
+            event_id,
+            len(msg.text),
+            msg.is_final,
+        )
+
+        # Edit the message with new content
+        if event_id:
+            await self.edit_message(room_id, event_id, msg.text)
+
+            # If this is the final update, stop typing, add completion reaction, and cleanup
+            if msg.is_final:
+                await self._stop_typing(room_id)
+                # Note: The reaction should be added to the original message event_id
+                # not the edit event, so users see the reaction on the message
+                await self._send_reaction(room_id, event_id, "✅")
+                # Cleanup tracked message
+                self._streaming_messages.pop(room_id, None)
+
+    def supports_streaming(self) -> bool:
+        """Return True if this channel supports message editing for streaming."""
+        return True

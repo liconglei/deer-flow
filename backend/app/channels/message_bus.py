@@ -90,6 +90,7 @@ class OutboundMessage:
         text: The response text.
         artifacts: List of artifact paths produced by the agent.
         is_final: Whether this is the final message in the response stream.
+        message_id: Platform-specific message ID (for editing in streaming).
         thread_ts: Optional platform thread identifier for threaded replies.
         metadata: Arbitrary extra data.
         created_at: Unix timestamp.
@@ -102,9 +103,34 @@ class OutboundMessage:
     artifacts: list[str] = field(default_factory=list)
     attachments: list[ResolvedAttachment] = field(default_factory=list)
     is_final: bool = True
+    message_id: str | None = None  # For streaming: platform message ID to edit
     thread_ts: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
     created_at: float = field(default_factory=time.time)
+
+
+@dataclass
+class StreamUpdateMessage:
+    """A streaming update message for real-time response editing.
+
+    Used when a channel supports message editing (e.g., Matrix, Telegram).
+    The channel can edit a previously sent message instead of sending new ones.
+
+    Attributes:
+        channel_name: Target channel name.
+        chat_id: Target chat/conversation identifier.
+        message_id: Platform message ID to edit.
+        text: The updated text content.
+        is_final: Whether this is the final update (stream ended).
+        thread_ts: Optional platform thread identifier.
+    """
+
+    channel_name: str
+    chat_id: str
+    message_id: str
+    text: str
+    is_final: bool = False
+    thread_ts: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -112,6 +138,7 @@ class OutboundMessage:
 # ---------------------------------------------------------------------------
 
 OutboundCallback = Callable[[OutboundMessage], Coroutine[Any, Any, None]]
+StreamUpdateCallback = Callable[[StreamUpdateMessage], Coroutine[Any, Any, None]]
 
 
 class MessageBus:
@@ -120,11 +147,16 @@ class MessageBus:
     Channels publish inbound messages; the dispatcher consumes them.
     The dispatcher publishes outbound messages; channels receive them
     via registered callbacks.
+
+    For streaming support:
+    - Channels register stream update callbacks to receive real-time edits
+    - Dispatcher publishes stream updates during streaming response generation
     """
 
     def __init__(self) -> None:
         self._inbound_queue: asyncio.Queue[InboundMessage] = asyncio.Queue()
         self._outbound_listeners: list[OutboundCallback] = []
+        self._stream_update_listeners: list[StreamUpdateCallback] = []
 
     # -- inbound -----------------------------------------------------------
 
@@ -171,3 +203,31 @@ class MessageBus:
                 await callback(msg)
             except Exception:
                 logger.exception("Error in outbound callback for channel=%s", msg.channel_name)
+
+    # -- streaming ---------------------------------------------------------
+
+    def subscribe_stream_update(self, callback: StreamUpdateCallback) -> None:
+        """Register an async callback for streaming message updates."""
+        self._stream_update_listeners.append(callback)
+
+    def unsubscribe_stream_update(self, callback: StreamUpdateCallback) -> None:
+        """Remove a previously registered stream update callback."""
+        self._stream_update_listeners = [
+            cb for cb in self._stream_update_listeners if cb is not callback
+        ]
+
+    async def publish_stream_update(self, msg: StreamUpdateMessage) -> None:
+        """Dispatch a streaming update to all registered listeners."""
+        logger.debug(
+            "[Bus] stream update: channel=%s, chat_id=%s, msg_id=%s, text_len=%d, is_final=%s",
+            msg.channel_name,
+            msg.chat_id,
+            msg.message_id,
+            len(msg.text),
+            msg.is_final,
+        )
+        for callback in self._stream_update_listeners:
+            try:
+                await callback(msg)
+            except Exception:
+                logger.exception("Error in stream update callback for channel=%s", msg.channel_name)
