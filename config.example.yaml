@@ -474,3 +474,14 @@ checkpointer:
 #           context:
 #             thinking_enabled: true
 #             subagent_enabled: true
+#
+#   matrix:
+#     enabled: false
+#     homeserver: https://matrix.org   # Matrix homeserver URL
+#     user_id: "@bot:matrix.org"       # Matrix user ID
+#     password: $MATRIX_PASSWORD       # Use password for login
+#     # access_token: $MATRIX_ACCESS_TOKEN  # Or use access token instead of password
+#     device_id: deer-flow-bot         # Device ID for the session
+#     allowed_rooms: []                # List of room IDs to listen to (empty = all)
+#     allowed_users: []                # List of user IDs allowed to interact (empty = all)
+#     # store_path: /path/to/store     # Optional: path to store encryption keys
