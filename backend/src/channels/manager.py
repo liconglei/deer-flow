@@ -6,6 +6,7 @@ import asyncio
 import logging
 import mimetypes
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Any
 
 from src.channels.message_bus import InboundMessage, InboundMessageType, MessageBus, OutboundMessage, ResolvedAttachment
@@ -185,6 +186,66 @@ def _resolve_attachments(thread_id: str, artifacts: list[str]) -> list[ResolvedA
     return attachments
 
 
+_UPLOADS_VIRTUAL_PREFIX = "/mnt/user-data/uploads/"
+
+
+def _process_user_files(thread_id: str, files: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Process user-uploaded files by copying them to thread uploads directory.
+
+    Args:
+        thread_id: The DeerFlow thread ID.
+        files: List of file dicts with 'path', 'type', 'filename' keys.
+
+    Returns:
+        List of file dicts with 'virtual_path' key added for each file.
+    """
+    import shutil
+
+    from src.config.paths import get_paths
+
+    if not files:
+        return []
+
+    paths = get_paths()
+    uploads_dir = paths.sandbox_uploads_dir(thread_id).resolve()
+    uploads_dir.mkdir(parents=True, exist_ok=True)
+
+    processed_files = []
+    for file_info in files:
+        src_path = Path(file_info.get("path", ""))
+        if not src_path.exists():
+            logger.warning("[Manager] user file not found: %s", src_path)
+            continue
+
+        # Copy file to uploads directory
+        filename = file_info.get("filename", src_path.name)
+        dest_path = uploads_dir / filename
+
+        # Handle filename conflicts
+        if dest_path.exists():
+            import uuid
+            stem = dest_path.stem
+            suffix = dest_path.suffix
+            dest_path = uploads_dir / f"{stem}_{uuid.uuid4().hex[:8]}{suffix}"
+
+        try:
+            shutil.copy2(src_path, dest_path)
+            logger.info("[Manager] copied user file to uploads: %s -> %s", src_path, dest_path)
+
+            # Create virtual path for the agent
+            virtual_path = f"{_UPLOADS_VIRTUAL_PREFIX}{dest_path.name}"
+
+            processed_files.append({
+                **file_info,
+                "virtual_path": virtual_path,
+                "actual_path": dest_path,
+            })
+        except OSError as exc:
+            logger.warning("[Manager] failed to copy user file %s: %s", src_path, exc)
+
+    return processed_files
+
+
 class ChannelManager:
     """Core dispatcher that bridges IM channels to the DeerFlow agent.
 
@@ -362,12 +423,29 @@ class ChannelManager:
         if thread_id is None:
             thread_id = await self._create_thread(client, msg)
 
+        # Process user-uploaded files (images, files, etc.)
+        processed_files = _process_user_files(thread_id, msg.files)
+        text = msg.text
+
+        # Update message text to include file paths for agent to access
+        if processed_files:
+            file_paths = []
+            for f in processed_files:
+                virtual_path = f.get("virtual_path", "")
+                file_type = f.get("type", "file")
+                filename = f.get("filename", "unknown")
+                if virtual_path:
+                    file_paths.append(f"- {filename} ({file_type}): {virtual_path}")
+            if file_paths:
+                text = f"{text}\n\n用户发送的文件:\n" + "\n".join(file_paths)
+                logger.info("[Manager] processed %d user files for thread %s", len(processed_files), thread_id)
+
         assistant_id, run_config, run_context = self._resolve_run_params(msg, thread_id)
-        logger.info("[Manager] invoking runs.wait(thread_id=%s, text=%r)", thread_id, msg.text[:100])
+        logger.info("[Manager] invoking runs.wait(thread_id=%s, text=%r)", thread_id, text[:100])
         result = await client.runs.wait(
             thread_id,
             assistant_id,
-            input={"messages": [{"role": "human", "content": msg.text}]},
+            input={"messages": [{"role": "human", "content": text}]},
             config=run_config,
             context=run_context,
         )

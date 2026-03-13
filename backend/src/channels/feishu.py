@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import tempfile
 import threading
+from pathlib import Path
 from typing import Any
 
 from src.channels.base import Channel
@@ -261,6 +263,153 @@ class FeishuChannel(Channel):
             raise RuntimeError(f"Feishu file upload failed: code={response.code}, msg={response.msg}")
         return response.data.file_key
 
+    async def _download_user_image(self, message_id: str, image_key: str) -> Path | None:
+        """Download a user-sent image from Feishu using the message resources API.
+
+        User-sent images must use /im/v1/messages/{message_id}/resources/{file_key} API,
+        not the /im/v1/images/{image_key} API (which is only for bot-uploaded images).
+
+        Args:
+            message_id: The message ID containing the image.
+            image_key: The Feishu image key (file_key in resources API).
+
+        Returns:
+            Path to the downloaded image file, or None if download failed.
+        """
+        if not self._api_client:
+            return None
+        try:
+            import httpx
+            from lark_oapi.core.token import TokenManager
+
+            # Get tenant access token using TokenManager
+            config = self._api_client._config
+            token = TokenManager.get_self_tenant_token(config)
+
+            # User-sent images must use the message resources API
+            # GET /open-apis/im/v1/messages/{message_id}/resources/{file_key}?type=image
+            url = f"https://open.feishu.cn/open-apis/im/v1/messages/{message_id}/resources/{image_key}?type=image"
+            headers = {"Authorization": f"Bearer {token}"}
+
+            async with httpx.AsyncClient(timeout=30) as client:
+                response = await client.get(url, headers=headers)
+
+            if response.status_code != 200:
+                # Try to parse error message
+                try:
+                    error_data = response.json()
+                    error_code = error_data.get("code", "unknown")
+                    error_msg = error_data.get("msg", response.text[:200])
+                    logger.error(
+                        "[Feishu] failed to download user image %s from message %s: status=%s, code=%s, msg=%s",
+                        image_key,
+                        message_id,
+                        response.status_code,
+                        error_code,
+                        error_msg,
+                    )
+                except Exception:
+                    logger.error(
+                        "[Feishu] failed to download user image %s from message %s: status=%s, response=%s",
+                        image_key,
+                        message_id,
+                        response.status_code,
+                        response.text[:200] if response.text else "empty",
+                    )
+                return None
+
+            # Determine file extension from content-type or default to .png
+            content_type = response.headers.get("Content-Type", "")
+            ext_map = {"image/png": ".png", "image/jpeg": ".jpg", "image/gif": ".gif", "image/webp": ".webp"}
+            ext = ext_map.get(content_type, ".png")
+
+            # Save to temp directory
+            temp_dir = Path(tempfile.gettempdir()) / "deer-flow-feishu"
+            temp_dir.mkdir(parents=True, exist_ok=True)
+            file_path = temp_dir / f"{image_key}{ext}"
+
+            with open(file_path, "wb") as f:
+                f.write(response.content)
+
+            logger.info("[Feishu] downloaded user image: %s -> %s (%d bytes)", image_key, file_path, len(response.content))
+            return file_path
+        except Exception:
+            logger.exception("[Feishu] failed to download user image %s", image_key)
+            return None
+
+    async def _download_user_file(self, message_id: str, file_key: str, filename: str, resource_type: str = "file") -> Path | None:
+        """Download a user-sent file from Feishu using the message resources API.
+
+        User-sent files must use /im/v1/messages/{message_id}/resources/{file_key} API,
+        not the /im/v1/files/{file_key} API (which is only for bot-uploaded files).
+
+        Args:
+            message_id: The message ID containing the file.
+            file_key: The Feishu file key.
+            filename: The original filename.
+            resource_type: The resource type (file, media, audio).
+
+        Returns:
+            Path to the downloaded file, or None if download failed.
+        """
+        if not self._api_client:
+            return None
+        try:
+            import httpx
+            from lark_oapi.core.token import TokenManager
+
+            # Get tenant access token using TokenManager
+            config = self._api_client._config
+            token = TokenManager.get_self_tenant_token(config)
+
+            # User-sent files must use the message resources API
+            # GET /open-apis/im/v1/messages/{message_id}/resources/{file_key}?type={type}
+            url = f"https://open.feishu.cn/open-apis/im/v1/messages/{message_id}/resources/{file_key}?type={resource_type}"
+            headers = {"Authorization": f"Bearer {token}"}
+
+            async with httpx.AsyncClient(timeout=60) as client:
+                response = await client.get(url, headers=headers)
+
+            if response.status_code != 200:
+                # Try to parse error message
+                try:
+                    error_data = response.json()
+                    error_code = error_data.get("code", "unknown")
+                    error_msg = error_data.get("msg", response.text[:200])
+                    logger.error(
+                        "[Feishu] failed to download user file %s from message %s: status=%s, code=%s, msg=%s",
+                        file_key,
+                        message_id,
+                        response.status_code,
+                        error_code,
+                        error_msg,
+                    )
+                except Exception:
+                    logger.error(
+                        "[Feishu] failed to download user file %s from message %s: status=%s, response=%s",
+                        file_key,
+                        message_id,
+                        response.status_code,
+                        response.text[:200] if response.text else "empty",
+                    )
+                return None
+
+            # Save to temp directory
+            temp_dir = Path(tempfile.gettempdir()) / "deer-flow-feishu"
+            temp_dir.mkdir(parents=True, exist_ok=True)
+            # Use original filename or fallback
+            safe_filename = Path(filename).name if filename else f"{file_key}.bin"
+            file_path = temp_dir / safe_filename
+
+            with open(file_path, "wb") as f:
+                f.write(response.content)
+
+            logger.info("[Feishu] downloaded user file: %s -> %s (%d bytes)", file_key, file_path, len(response.content))
+            return file_path
+        except Exception:
+            logger.exception("[Feishu] failed to download user file %s", file_key)
+            return None
+
     # -- message formatting ------------------------------------------------
 
     @staticmethod
@@ -320,6 +469,7 @@ class FeishuChannel(Channel):
             message = event.event.message
             chat_id = message.chat_id
             msg_id = message.message_id
+            msg_type_feishu = message.message_type  # e.g., "text", "image", "file", "media"
             sender_id = event.event.sender.sender_id.open_id
 
             # root_id is set when the message is a reply within a Feishu thread.
@@ -329,17 +479,165 @@ class FeishuChannel(Channel):
             # Parse message content
             content = json.loads(message.content)
             text = content.get("text", "").strip()
+
+            # Handle different message types
+            files: list[dict[str, Any]] = []
+            download_error_detail = ""
+            if msg_type_feishu == "image":
+                # Image message: {"image_key": "img_xxx"}
+                # User-sent images must use /im/v1/messages/{message_id}/resources/{file_key} API
+                image_key = content.get("image_key")
+                if image_key:
+                    logger.info("[Feishu] image message received: msg_id=%s, image_key=%s", msg_id, image_key)
+                    # Download image using main loop via run_coroutine_threadsafe
+                    try:
+                        if self._main_loop and self._main_loop.is_running():
+                            future = asyncio.run_coroutine_threadsafe(
+                                self._download_user_image(msg_id, image_key), self._main_loop
+                            )
+                            file_path = future.result(timeout=30)  # Wait up to 30 seconds
+                            if file_path:
+                                text = "[用户发送了一张图片]"
+                                files.append({
+                                    "type": "image",
+                                    "path": str(file_path),
+                                    "filename": file_path.name,
+                                })
+                            else:
+                                text = "[用户发送了一张图片，但下载失败]"
+                                download_error_detail = f" (msg_id={msg_id}, image_key={image_key})"
+                        else:
+                            logger.warning("[Feishu] main loop not running, cannot download image")
+                            text = "[用户发送了一张图片，但系统无法处理]"
+                            download_error_detail = " (系统事件循环未运行)"
+                    except Exception as e:
+                        logger.exception("[Feishu] failed to download image")
+                        text = f"[用户发送了一张图片，但下载失败: {type(e).__name__}]"
+            elif msg_type_feishu == "file":
+                # File message: {"file_key": "file_xxx", "file_name": "xxx.pdf"}
+                # User-sent files must use /im/v1/messages/{message_id}/resources/{file_key} API
+                file_key = content.get("file_key")
+                file_name = content.get("file_name", "unknown_file")
+                if file_key:
+                    logger.info("[Feishu] file message received: msg_id=%s, file_key=%s, file_name=%s", msg_id, file_key, file_name)
+                    
+                    # Check if file is a video - videos are not supported
+                    video_extensions = {".mp4", ".mov", ".avi", ".mkv", ".wmv", ".flv", ".webm", ".m4v", ".3gp", ".mpeg", ".mpg"}
+                    file_ext = Path(file_name).suffix.lower() if file_name else ""
+                    if file_ext in video_extensions:
+                        logger.info("[Feishu] video file ignored (not supported): %s", file_name)
+                        text = f"[用户发送了一个视频文件: {file_name}]\n\n抱歉，暂不支持视频文件处理。如需分析视频内容，请提取视频帧后以图片形式发送。"
+                    else:
+                        # Download file using main loop via run_coroutine_threadsafe
+                        try:
+                            if self._main_loop and self._main_loop.is_running():
+                                future = asyncio.run_coroutine_threadsafe(
+                                    self._download_user_file(msg_id, file_key, file_name), self._main_loop
+                                )
+                                file_path = future.result(timeout=60)  # Wait up to 60 seconds for files
+                                if file_path:
+                                    text = f"[用户发送了一个文件: {file_name}]"
+                                    files.append({
+                                        "type": "file",
+                                        "path": str(file_path),
+                                        "filename": file_name,
+                                    })
+                                else:
+                                    text = f"[用户发送了一个文件: {file_name}，但下载失败]"
+                            else:
+                                logger.warning("[Feishu] main loop not running, cannot download file")
+                                text = f"[用户发送了一个文件: {file_name}，但系统无法处理]"
+                        except Exception:
+                            logger.exception("[Feishu] failed to download file")
+                            text = f"[用户发送了一个文件: {file_name}，但下载失败]"
+            elif msg_type_feishu == "audio":
+                # Audio message (voice): {"file_key": "file_xxx", "duration": 60}
+                # User-sent audio must use /im/v1/messages/{message_id}/resources/{file_key} API
+                file_key = content.get("file_key")
+                duration_ms = content.get("duration", 0)  # Duration in milliseconds
+                duration_sec = duration_ms / 1000 if duration_ms else 0  # Convert to seconds
+                file_name = f"voice_{msg_id}.mp3"  # Feishu voice messages are typically mp3
+                if file_key:
+                    logger.info("[Feishu] audio message received: msg_id=%s, file_key=%s, duration=%sms (%ss)", msg_id, file_key, duration_ms, duration_sec)
+                    # Download audio file using main loop via run_coroutine_threadsafe
+                    try:
+                        if self._main_loop and self._main_loop.is_running():
+                            future = asyncio.run_coroutine_threadsafe(
+                                self._download_user_file(msg_id, file_key, file_name, resource_type="file"), self._main_loop
+                            )
+                            file_path = future.result(timeout=60)  # Wait up to 60 seconds for audio
+                            if file_path:
+                                duration_text = f"{duration_sec}秒" if duration_sec else "未知时长"
+                                text = f"[用户发送了一条语音消息，时长: {duration_text}]"
+                                files.append({
+                                    "type": "audio",
+                                    "path": str(file_path),
+                                    "filename": file_name,
+                                    "duration": duration,
+                                })
+                            else:
+                                text = "[用户发送了一条语音消息，但下载失败]"
+                        else:
+                            logger.warning("[Feishu] main loop not running, cannot download audio")
+                            text = "[用户发送了一条语音消息，但系统无法处理]"
+                    except Exception:
+                        logger.exception("[Feishu] failed to download audio file")
+                        text = "[用户发送了一条语音消息，但下载失败]"
+            elif msg_type_feishu == "media":
+                # Media message (audio/video): {"file_key": "file_xxx", "file_name": "xxx.mp3"}
+                # User-sent media must use /im/v1/messages/{message_id}/resources/{file_key} API
+                file_key = content.get("file_key")
+                file_name = content.get("file_name", "unknown_media")
+                if file_key:
+                    logger.info("[Feishu] media message received: msg_id=%s, file_key=%s, file_name=%s", msg_id, file_key, file_name)
+                    
+                    # Check if file is a video - videos are not supported
+                    video_extensions = {".mp4", ".mov", ".avi", ".mkv", ".wmv", ".flv", ".webm", ".m4v", ".3gp", ".mpeg", ".mpg"}
+                    file_ext = Path(file_name).suffix.lower() if file_name else ""
+                    if file_ext in video_extensions:
+                        logger.info("[Feishu] video file ignored (not supported): %s", file_name)
+                        text = f"[用户发送了一个视频文件: {file_name}]\n\n抱歉，暂不支持视频文件处理。如需分析视频内容，请提取视频帧后以图片形式发送。"
+                    else:
+                        # Download media file using main loop via run_coroutine_threadsafe
+                        try:
+                            if self._main_loop and self._main_loop.is_running():
+                                future = asyncio.run_coroutine_threadsafe(
+                                    self._download_user_file(msg_id, file_key, file_name, resource_type="media"), self._main_loop
+                                )
+                                file_path = future.result(timeout=60)  # Wait up to 60 seconds for media
+                                if file_path:
+                                    text = f"[用户发送了一个媒体文件: {file_name}]"
+                                    files.append({
+                                        "type": "media",
+                                        "path": str(file_path),
+                                        "filename": file_name,
+                                    })
+                                else:
+                                    text = f"[用户发送了一个媒体文件: {file_name}，但下载失败]"
+                            else:
+                                logger.warning("[Feishu] main loop not running, cannot download media")
+                                text = f"[用户发送了一个媒体文件: {file_name}，但系统无法处理]"
+                        except Exception:
+                            logger.exception("[Feishu] failed to download media file")
+                            text = f"[用户发送了一个媒体文件: {file_name}，但下载失败]"
+            elif msg_type_feishu == "post":
+                # Rich text post: extract plain text content
+                post_content = content.get("content", [])
+                text = self._extract_post_text(post_content) or text
+
             logger.info(
-                "[Feishu] parsed message: chat_id=%s, msg_id=%s, root_id=%s, sender=%s, text=%r",
+                "[Feishu] parsed message: chat_id=%s, msg_id=%s, root_id=%s, sender=%s, msg_type=%s, text=%r, files=%d",
                 chat_id,
                 msg_id,
                 root_id,
                 sender_id,
+                msg_type_feishu,
                 text[:100] if text else "",
+                len(files),
             )
 
-            if not text:
-                logger.info("[Feishu] empty text, ignoring message")
+            if not text and not files:
+                logger.info("[Feishu] empty text and no files, ignoring message")
                 return
 
             # Check if it's a command
@@ -357,7 +655,8 @@ class FeishuChannel(Channel):
                 text=text,
                 msg_type=msg_type,
                 thread_ts=msg_id,
-                metadata={"message_id": msg_id, "root_id": root_id},
+                files=files,
+                metadata={"message_id": msg_id, "root_id": root_id, "feishu_msg_type": msg_type_feishu},
             )
             inbound.topic_id = topic_id
 
@@ -376,3 +675,27 @@ class FeishuChannel(Channel):
                 logger.warning("[Feishu] main loop not running, cannot publish inbound message")
         except Exception:
             logger.exception("[Feishu] error processing message")
+
+    @staticmethod
+    def _extract_post_text(post_content: list) -> str:
+        """Extract plain text from a Feishu post (rich text) message.
+
+        Args:
+            post_content: List of post sections, each containing elements.
+
+        Returns:
+            Combined plain text from all text elements.
+        """
+        if not isinstance(post_content, list):
+            return ""
+
+        text_parts = []
+        for section in post_content:
+            if not isinstance(section, dict):
+                continue
+            elements = section.get("elements", [])
+            for elem in elements:
+                if isinstance(elem, dict) and elem.get("tag") == "text":
+                    text_parts.append(elem.get("text", ""))
+
+        return " ".join(text_parts).strip()

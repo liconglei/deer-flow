@@ -91,21 +91,23 @@ class ViewImageMiddleware(AgentMiddleware[ViewImageMiddlewareState]):
         # Check if all tool calls have been completed
         return tool_call_ids.issubset(completed_tool_ids)
 
-    def _create_image_details_message(self, state: ViewImageMiddlewareState) -> list[str | dict]:
+    def _create_image_details_message(self, state: ViewImageMiddlewareState) -> list[dict]:
         """Create a formatted message with all viewed image details.
 
         Args:
             state: Current state containing viewed_images
 
         Returns:
-            List of content blocks (text and images) for the HumanMessage
+            List of content blocks (text and images) for the HumanMessage.
+            Always returns a list of dict objects to comply with OpenAI API requirements.
         """
         viewed_images = state.get("viewed_images", {})
         if not viewed_images:
-            return ["No images have been viewed."]
+            # Return properly formatted content block (must be dict, not string)
+            return [{"type": "text", "text": "No images have been viewed."}]
 
         # Build the message with image information
-        content_blocks: list[str | dict] = [{"type": "text", "text": "Here are the images you've viewed:"}]
+        content_blocks: list[dict] = [{"type": "text", "text": "Here are the images you've viewed:"}]
 
         for image_path, image_data in viewed_images.items():
             mime_type = image_data.get("mime_type", "unknown")
