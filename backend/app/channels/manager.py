@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import mimetypes
+import shutil
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Any
 
 from src.channels.message_bus import InboundMessage, InboundMessageType, MessageBus, OutboundMessage, ResolvedAttachment, StreamUpdateMessage
@@ -35,6 +37,146 @@ def _merge_dicts(*layers: Any) -> dict[str, Any]:
         if isinstance(layer, Mapping):
             merged.update(layer)
     return merged
+
+
+def _compute_file_hash(file_path: Path, chunk_size: int = 8192) -> str:
+    """Compute SHA256 hash of a file.
+
+    Args:
+        file_path: Path to the file.
+        chunk_size: Size of chunks to read at a time.
+
+    Returns:
+        Hexadecimal hash string.
+    """
+    import hashlib
+
+    hasher = hashlib.sha256()
+    with open(file_path, "rb") as f:
+        while chunk := f.read(chunk_size):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+def _process_channel_files(thread_id: str, files: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Process files from channel messages and copy them to the thread's uploads directory.
+
+    Channel implementations download files to temporary locations. This function:
+    1. Checks if same filename exists - if yes, compares hash (reuse if same content)
+    2. Copies files to the correct thread uploads directory (with counter suffix if different content)
+    3. Returns file metadata compatible with UploadsMiddleware (additional_kwargs.files format)
+
+    Args:
+        thread_id: The DeerFlow thread ID.
+        files: List of file dicts from InboundMessage.files (each has 'path', 'filename', 'type').
+
+    Returns:
+        List of file metadata dicts for additional_kwargs.files.
+    """
+    if not files:
+        return []
+
+    from src.config.paths import get_paths
+
+    paths = get_paths()
+    uploads_dir = paths.sandbox_uploads_dir(thread_id)
+    uploads_dir.mkdir(parents=True, exist_ok=True)
+
+    processed_files = []
+    for file_info in files:
+        src_path = Path(file_info.get("path", ""))
+        filename = file_info.get("filename", src_path.name)
+        file_type = file_info.get("type", "file")
+
+        if not src_path.exists():
+            logger.warning("[Manager] channel file not found: %s", src_path)
+            continue
+
+        # Sanitize filename
+        safe_filename = Path(filename).name
+        if not safe_filename or safe_filename in {".", ".."}:
+            logger.warning("[Manager] skipping file with unsafe filename: %s", filename)
+            continue
+
+        dest_path = uploads_dir / safe_filename
+        src_hash = None  # Compute hash only when needed
+
+        # Check if file with same name exists
+        if dest_path.exists():
+            # Compare hash to determine if content is the same
+            src_hash = _compute_file_hash(src_path)
+            dest_hash = _compute_file_hash(dest_path)
+
+            if src_hash == dest_hash:
+                # Same content, reuse existing file
+                file_size = dest_path.stat().st_size
+                logger.info(
+                    "[Manager] reusing existing file with same hash: %s (hash=%s...)",
+                    safe_filename,
+                    src_hash[:8],
+                )
+                # Clean up temporary file
+                try:
+                    src_path.unlink()
+                except Exception:
+                    pass
+            else:
+                # Different content, find a new filename with counter
+                base = dest_path.stem
+                suffix = dest_path.suffix
+                counter = 1
+                while dest_path.exists():
+                    dest_path = uploads_dir / f"{base}_{counter}{suffix}"
+                    counter += 1
+                safe_filename = dest_path.name
+
+                try:
+                    shutil.copy2(src_path, dest_path)
+                    file_size = dest_path.stat().st_size
+                    logger.info(
+                        "[Manager] copied channel file (different content): %s -> %s (%d bytes)",
+                        src_path.name,
+                        dest_path,
+                        file_size,
+                    )
+                    # Clean up temporary file
+                    try:
+                        src_path.unlink()
+                    except Exception:
+                        pass
+                except Exception as exc:
+                    logger.warning("[Manager] failed to copy channel file %s: %s", src_path, exc)
+                    continue
+        else:
+            # No existing file with same name, copy directly
+            try:
+                shutil.copy2(src_path, dest_path)
+                file_size = dest_path.stat().st_size
+                logger.info(
+                    "[Manager] copied channel file: %s -> %s (%d bytes)",
+                    src_path.name,
+                    dest_path,
+                    file_size,
+                )
+                # Clean up temporary file
+                try:
+                    src_path.unlink()
+                except Exception:
+                    pass
+            except Exception as exc:
+                logger.warning("[Manager] failed to copy channel file %s: %s", src_path, exc)
+                continue
+
+        # Build metadata compatible with UploadsMiddleware
+        processed_files.append({
+            "filename": safe_filename,
+            "size": file_size,
+            "path": f"/mnt/user-data/uploads/{safe_filename}",  # Virtual path for agent
+            "extension": Path(safe_filename).suffix,
+            "type": file_type,  # Preserve original type (image, video, audio, file)
+        })
+
+    return processed_files
 
 
 def _extract_response_text(result: dict | list) -> str:
@@ -380,8 +522,18 @@ class ChannelManager:
         if thread_id is None:
             thread_id = await self._create_thread(client, msg)
 
+        # Process channel file attachments (copy to uploads directory)
+        processed_files = _process_channel_files(thread_id, msg.files)
+        if processed_files:
+            logger.info("[Manager] processed %d file(s) from channel: %s", len(processed_files), [f["filename"] for f in processed_files])
+
         assistant_id, run_config, run_context = self._resolve_run_params(msg, thread_id)
         logger.info("[Manager] invoking runs.stream(thread_id=%s, text=%r)", thread_id, msg.text[:100] if msg.text else "")
+
+        # Build message with file attachments if any
+        human_message: dict[str, Any] = {"role": "human", "content": msg.text}
+        if processed_files:
+            human_message["additional_kwargs"] = {"files": processed_files}
 
         # Track streaming state
         accumulated_text = ""
@@ -397,7 +549,7 @@ class ChannelManager:
             async for event in client.runs.stream(
                 thread_id,
                 assistant_id,
-                input={"messages": [{"role": "human", "content": msg.text}]},
+                input={"messages": [human_message]},
                 config=run_config,
                 context=run_context,
                 stream_mode=["messages"],
@@ -511,12 +663,23 @@ class ChannelManager:
         if thread_id is None:
             thread_id = await self._create_thread(client, msg)
 
+        # Process channel file attachments (copy to uploads directory)
+        processed_files = _process_channel_files(thread_id, msg.files)
+        if processed_files:
+            logger.info("[Manager] processed %d file(s) from channel: %s", len(processed_files), [f["filename"] for f in processed_files])
+
         assistant_id, run_config, run_context = self._resolve_run_params(msg, thread_id)
         logger.info("[Manager] invoking runs.wait(thread_id=%s, text=%r)", thread_id, msg.text[:100])
+
+        # Build message with file attachments if any
+        human_message: dict[str, Any] = {"role": "human", "content": msg.text}
+        if processed_files:
+            human_message["additional_kwargs"] = {"files": processed_files}
+
         result = await client.runs.wait(
             thread_id,
             assistant_id,
-            input={"messages": [{"role": "human", "content": msg.text}]},
+            input={"messages": [human_message]},
             config=run_config,
             context=run_context,
         )

@@ -593,8 +593,6 @@ class MatrixChannel(Channel):
     async def _download_matrix_media(self, mxc_uri: str, filename: str) -> Path | None:
         """Download media from Matrix server, with automatic decryption for encrypted rooms.
 
-        Uses nio's download_mxc() which handles encrypted media transparently.
-
         Args:
             mxc_uri: Matrix content URI (e.g., "mxc://matrix.org/abc123")
             filename: Original filename.
@@ -608,8 +606,24 @@ class MatrixChannel(Channel):
         try:
             from nio import DownloadResponse
 
-            # Use nio's download_mxc for automatic decryption support
-            response = await self._client.download_mxc(mxc_uri)
+            # Parse mxc:// URI: mxc://server_name/media_id
+            if not mxc_uri.startswith("mxc://"):
+                logger.warning("[Matrix] invalid mxc URI: %s", mxc_uri)
+                return None
+
+            parts = mxc_uri[6:].split("/", 1)
+            if len(parts) != 2:
+                logger.warning("[Matrix] invalid mxc URI format: %s", mxc_uri)
+                return None
+
+            server_name, media_id = parts
+
+            # Use nio's download() for automatic decryption support
+            response = await self._client.download(
+                server_name=server_name,
+                media_id=media_id,
+                filename=filename,
+            )
 
             if not isinstance(response, DownloadResponse):
                 logger.warning("[Matrix] failed to download media %s: %s", mxc_uri, response)
@@ -620,7 +634,7 @@ class MatrixChannel(Channel):
             temp_dir.mkdir(parents=True, exist_ok=True)
 
             # Sanitize filename
-            safe_filename = Path(filename).name if filename else mxc_uri.split("/")[-1]
+            safe_filename = Path(filename).name if filename else media_id
             file_path = temp_dir / safe_filename
 
             with open(file_path, "wb") as f:
@@ -635,34 +649,248 @@ class MatrixChannel(Channel):
 
     @staticmethod
     def _markdown_to_html(text: str) -> str:
-        """Convert basic markdown to HTML for Matrix formatted messages.
+        """Convert markdown to HTML for Matrix formatted messages.
 
-        Matrix supports a subset of HTML. This converts common markdown
-        formatting to HTML tags.
+        Matrix supports a subset of HTML. This converts markdown formatting
+        to Matrix-compatible HTML tags.
+
+        Supported markdown:
+        - Headers: # ## ### #### ##### ######
+        - Bold: **text** or __text__
+        - Italic: *text* or _text_
+        - Strikethrough: ~~text~~
+        - Code blocks: ```lang\ncode```
+        - Inline code: `code`
+        - Links: [text](url)
+        - Unordered lists: - item or * item
+        - Ordered lists: 1. item
+        - Task lists: - [ ] item or - [x] item
+        - Blockquotes: > text
+        - Horizontal rules: --- or ***
+        - Tables: | col1 | col2 |
         """
         import re
 
-        # Escape HTML entities first
-        text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        lines = text.split("\n")
+        result_lines = []
+        in_code_block = False
+        code_block_lang = ""
+        code_block_content = []
+        in_list = False
+        list_type = None  # "ul" or "ol"
+        in_blockquote = False
+        in_table = False
+        table_rows = []
 
-        # Code blocks
-        text = re.sub(r"```(\w*)\n(.*?)```", r"<pre><code class='\1'>\2</code></pre>", text, flags=re.DOTALL)
+        def escape_html(s: str) -> str:
+            """Escape HTML entities."""
+            return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
-        # Inline code
-        text = re.sub(r"`([^`]+)`", r"<code>\1</code>", text)
+        i = 0
+        while i < len(lines):
+            line = lines[i]
 
-        # Bold
+            # Code blocks (handle first, as they contain raw content)
+            if line.strip().startswith("```"):
+                if not in_code_block:
+                    in_code_block = True
+                    code_block_lang = line.strip()[3:].strip()
+                    code_block_content = []
+                else:
+                    # End code block - escape and output
+                    code_html = escape_html("\n".join(code_block_content))
+                    if code_block_lang:
+                        result_lines.append(f"<pre><code class='{code_block_lang}'>{code_html}</code></pre>")
+                    else:
+                        result_lines.append(f"<pre><code>{code_html}</code></pre>")
+                    in_code_block = False
+                    code_block_lang = ""
+                    code_block_content = []
+                i += 1
+                continue
+
+            if in_code_block:
+                code_block_content.append(line)
+                i += 1
+                continue
+
+            # Close list if needed
+            if in_list and not (line.strip().startswith(("-", "*", "+")) or re.match(r"^(\s*)[-*+]\s+\[", line) or re.match(r"^\d+\.\s", line.strip())):
+                result_lines.append("</ul>" if list_type == "ul" else "</ol>")
+                in_list = False
+                list_type = None
+
+            # Close blockquote if needed
+            if in_blockquote and not line.strip().startswith(">"):
+                result_lines.append("</blockquote>")
+                in_blockquote = False
+
+            # Close table if needed
+            if in_table and not line.strip().startswith("|"):
+                if table_rows:
+                    result_lines.append("<table>")
+                    for idx, row in enumerate(table_rows):
+                        cells = [escape_html(c.strip()) for c in row.split("|")[1:-1]]
+                        if idx == 0:
+                            result_lines.append("<thead><tr>")
+                            for cell in cells:
+                                result_lines.append(f"<th>{cell}</th>")
+                            result_lines.append("</tr></thead><tbody>")
+                        elif not re.match(r"^[\s\-:|]+$", row):  # Skip separator rows
+                            result_lines.append("<tr>")
+                            for cell in cells:
+                                result_lines.append(f"<td>{cell}</td>")
+                            result_lines.append("</tr>")
+                    result_lines.append("</tbody></table>")
+                table_rows = []
+                in_table = False
+
+            # Empty line
+            if not line.strip():
+                i += 1
+                continue
+
+            # Horizontal rules
+            if re.match(r"^(-{3,}|\*{3,}|_{3,})$", line.strip()):
+                result_lines.append("<hr>")
+                i += 1
+                continue
+
+            # Headers
+            header_match = re.match(r"^(#{1,6})\s+(.+)$", line)
+            if header_match:
+                level = len(header_match.group(1))
+                content = MatrixChannel._format_inline_md(escape_html(header_match.group(2)))
+                result_lines.append(f"<h{level}>{content}</h{level}>")
+                i += 1
+                continue
+
+            # Blockquotes
+            if line.strip().startswith(">"):
+                if not in_blockquote:
+                    result_lines.append("<blockquote>")
+                    in_blockquote = True
+                quote_content = line.strip()[1:].strip()
+                result_lines.append(MatrixChannel._format_inline_md(escape_html(quote_content)))
+                i += 1
+                continue
+
+            # Tables
+            if line.strip().startswith("|"):
+                if not in_table:
+                    in_table = True
+                    table_rows = []
+                table_rows.append(line)
+                i += 1
+                continue
+
+            # Unordered lists (including task lists)
+            ul_match = re.match(r"^(\s*)[-*+]\s+(.*)$", line)
+            if ul_match:
+                if not in_list or list_type != "ul":
+                    if in_list:
+                        result_lines.append("</ol>" if list_type == "ol" else "</ul>")
+                    result_lines.append("<ul>")
+                    in_list = True
+                    list_type = "ul"
+                item_content = ul_match.group(2)
+                # Task list
+                task_match = re.match(r"^\[([ xX])\]\s*(.*)$", item_content)
+                if task_match:
+                    checked = task_match.group(1).lower() == "x"
+                    checkbox = "✅ " if checked else "⬜ "
+                    item_content = checkbox + MatrixChannel._format_inline_md(escape_html(task_match.group(2)))
+                else:
+                    item_content = MatrixChannel._format_inline_md(escape_html(item_content))
+                result_lines.append(f"<li>{item_content}</li>")
+                i += 1
+                continue
+
+            # Ordered lists
+            ol_match = re.match(r"^(\s*)\d+\.\s+(.*)$", line)
+            if ol_match:
+                if not in_list or list_type != "ol":
+                    if in_list:
+                        result_lines.append("</ul>" if list_type == "ul" else "</ol>")
+                    result_lines.append("<ol>")
+                    in_list = True
+                    list_type = "ol"
+                item_content = MatrixChannel._format_inline_md(escape_html(ol_match.group(2)))
+                result_lines.append(f"<li>{item_content}</li>")
+                i += 1
+                continue
+
+            # Regular paragraph
+            result_lines.append(f"<p>{MatrixChannel._format_inline_md(escape_html(line))}</p>")
+            i += 1
+
+        # Close any open tags
+        if in_code_block:
+            code_html = escape_html("\n".join(code_block_content))
+            result_lines.append(f"<pre><code>{code_html}</code></pre>")
+        if in_list:
+            result_lines.append("</ul>" if list_type == "ul" else "</ol>")
+        if in_blockquote:
+            result_lines.append("</blockquote>")
+        if in_table and table_rows:
+            result_lines.append("<table>")
+            for idx, row in enumerate(table_rows):
+                cells = [escape_html(c.strip()) for c in row.split("|")[1:-1]]
+                if idx == 0:
+                    result_lines.append("<thead><tr>")
+                    for cell in cells:
+                        result_lines.append(f"<th>{cell}</th>")
+                    result_lines.append("</tr></thead><tbody>")
+                elif not re.match(r"^[\s\-:|]+$", row):
+                    result_lines.append("<tr>")
+                    for cell in cells:
+                        result_lines.append(f"<td>{cell}</td>")
+                    result_lines.append("</tr>")
+            result_lines.append("</tbody></table>")
+
+        return "\n".join(result_lines)
+
+    @staticmethod
+    def _format_inline_md(text: str) -> str:
+        """Format inline markdown elements (bold, italic, code, links, strikethrough).
+
+        Note: text should already be HTML-escaped before calling this.
+        """
+        import re
+
+        # Inline code - use special markers to avoid double processing
+        # Since text is already escaped, we look for backticks directly
+        parts = []
+        last_end = 0
+        for match in re.finditer(r"`([^`]+)`", text):
+            # Add text before code
+            parts.append(text[last_end:match.start()])
+            # Add code (content is already escaped)
+            parts.append(f"<code>{match.group(1)}</code>")
+            last_end = match.end()
+        parts.append(text[last_end:])
+        text = "".join(parts)
+
+        # Bold: **text** or __text__
         text = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", text)
+        text = re.sub(r"__([^_]+)__", r"<strong>\1</strong>", text)
 
-        # Italic
+        # Italic: *text* or _text_ (must come after bold)
         text = re.sub(r"\*([^*]+)\*", r"<em>\1</em>", text)
+        text = re.sub(r"_([^_]+)_", r"<em>\1</em>", text)
 
-        # Links
-        text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r'<a href="\2">\1</a>', text)
+        # Strikethrough: ~~text~~
+        text = re.sub(r"~~([^~]+)~~", r"<del>\1</del>", text)
 
-        # Line breaks (double newline -> paragraph)
-        text = re.sub(r"\n\n", "</p><p>", text)
-        text = f"<p>{text}</p>"
+        # Links: [text](url) - URL needs to be unescaped for href
+        def replace_link(m):
+            link_text = m.group(1)
+            url = m.group(2)
+            # Unescape URL for href
+            url = url.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
+            return f'<a href="{url}">{link_text}</a>'
+
+        text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", replace_link, text)
 
         return text
 
