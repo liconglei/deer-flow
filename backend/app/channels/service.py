@@ -5,9 +5,9 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from src.channels.manager import ChannelManager
-from src.channels.message_bus import MessageBus
-from src.channels.store import ChannelStore
+from app.channels.manager import ChannelManager
+from app.channels.message_bus import MessageBus
+from app.channels.store import ChannelStore
 
 logger = logging.getLogger(__name__)
 
@@ -34,11 +34,7 @@ class ChannelService:
         langgraph_url = config.pop("langgraph_url", None) or "http://localhost:2024"
         gateway_url = config.pop("gateway_url", None) or "http://localhost:8001"
         default_session = config.pop("session", None)
-        channel_sessions = {
-            name: channel_config.get("session")
-            for name, channel_config in config.items()
-            if isinstance(channel_config, dict)
-        }
+        channel_sessions = {name: channel_config.get("session") for name, channel_config in config.items() if isinstance(channel_config, dict)}
         self.manager = ChannelManager(
             bus=self.bus,
             store=self.store,
@@ -54,7 +50,7 @@ class ChannelService:
     @classmethod
     def from_app_config(cls) -> ChannelService:
         """Create a ChannelService from the application config."""
-        from src.config.app_config import get_app_config
+        from deerflow.config.app_config import get_app_config
 
         config = get_app_config()
         channels_config = {}
@@ -121,7 +117,7 @@ class ChannelService:
             return False
 
         try:
-            from src.reflection import resolve_class
+            from deerflow.reflection import resolve_class
 
             channel_cls = resolve_class(import_path, base_class=None)
         except Exception:
