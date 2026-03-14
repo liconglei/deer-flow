@@ -481,7 +481,7 @@ class ChannelManager:
             thread_id = await self._create_thread(client, msg)
 
         assistant_id, run_config, run_context = self._resolve_run_params(msg, thread_id)
-        if msg.channel_name == "feishu":
+        if msg.channel_name in {"feishu", "matrix"}:
             await self._handle_streaming_chat(
                 client,
                 msg,

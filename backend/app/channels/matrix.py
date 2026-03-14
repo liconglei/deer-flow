@@ -228,16 +228,36 @@ class MatrixChannel(Channel):
             return
 
         logger.info(
-            "[Matrix] sending reply: room_id=%s, text_len=%d, thread_ts=%s",
+            "[Matrix] sending reply: room_id=%s, text_len=%d, thread_ts=%s, is_final=%s",
             msg.chat_id,
             len(msg.text),
             msg.thread_ts,
+            msg.is_final,
         )
 
         try:
             from nio import RoomSendResponse
 
-            # Stop typing notification for this room
+            # Check if we have a tracked event for this chat (streaming update)
+            tracked_event_id = self._streaming_messages.get(msg.chat_id)
+
+            if tracked_event_id and not msg.is_final:
+                # Streaming update: edit existing message
+                await self.edit_message(msg.chat_id, tracked_event_id, msg.text)
+                logger.debug("[Matrix] edited streaming message: chat=%s, event=%s", msg.chat_id, tracked_event_id)
+                return
+
+            if tracked_event_id and msg.is_final:
+                # Final streaming update: edit and cleanup
+                await self.edit_message(msg.chat_id, tracked_event_id, msg.text)
+                await self._stop_typing(msg.chat_id)
+                if msg.thread_ts:
+                    await self._send_reaction(msg.chat_id, msg.thread_ts, "✅")
+                self._streaming_messages.pop(msg.chat_id, None)
+                logger.info("[Matrix] streaming completed: chat=%s, event=%s", msg.chat_id, tracked_event_id)
+                return
+
+            # No tracked event: send new message
             await self._stop_typing(msg.chat_id)
 
             # Send message to room
