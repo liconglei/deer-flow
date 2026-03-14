@@ -5,13 +5,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import mimetypes
-import shutil
+import time
 from collections.abc import Mapping
-from pathlib import Path
 from typing import Any
 
-from src.channels.message_bus import InboundMessage, InboundMessageType, MessageBus, OutboundMessage, ResolvedAttachment, StreamUpdateMessage
-from src.channels.store import ChannelStore
+from app.channels.message_bus import InboundMessage, InboundMessageType, MessageBus, OutboundMessage, ResolvedAttachment
+from app.channels.store import ChannelStore
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +24,7 @@ DEFAULT_RUN_CONTEXT: dict[str, Any] = {
     "is_plan_mode": False,
     "subagent_enabled": False,
 }
+STREAM_UPDATE_MIN_INTERVAL_SECONDS = 0.35
 
 
 def _as_dict(value: Any) -> dict[str, Any]:
@@ -37,146 +37,6 @@ def _merge_dicts(*layers: Any) -> dict[str, Any]:
         if isinstance(layer, Mapping):
             merged.update(layer)
     return merged
-
-
-def _compute_file_hash(file_path: Path, chunk_size: int = 8192) -> str:
-    """Compute SHA256 hash of a file.
-
-    Args:
-        file_path: Path to the file.
-        chunk_size: Size of chunks to read at a time.
-
-    Returns:
-        Hexadecimal hash string.
-    """
-    import hashlib
-
-    hasher = hashlib.sha256()
-    with open(file_path, "rb") as f:
-        while chunk := f.read(chunk_size):
-            hasher.update(chunk)
-    return hasher.hexdigest()
-
-
-def _process_channel_files(thread_id: str, files: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Process files from channel messages and copy them to the thread's uploads directory.
-
-    Channel implementations download files to temporary locations. This function:
-    1. Checks if same filename exists - if yes, compares hash (reuse if same content)
-    2. Copies files to the correct thread uploads directory (with counter suffix if different content)
-    3. Returns file metadata compatible with UploadsMiddleware (additional_kwargs.files format)
-
-    Args:
-        thread_id: The DeerFlow thread ID.
-        files: List of file dicts from InboundMessage.files (each has 'path', 'filename', 'type').
-
-    Returns:
-        List of file metadata dicts for additional_kwargs.files.
-    """
-    if not files:
-        return []
-
-    from src.config.paths import get_paths
-
-    paths = get_paths()
-    uploads_dir = paths.sandbox_uploads_dir(thread_id)
-    uploads_dir.mkdir(parents=True, exist_ok=True)
-
-    processed_files = []
-    for file_info in files:
-        src_path = Path(file_info.get("path", ""))
-        filename = file_info.get("filename", src_path.name)
-        file_type = file_info.get("type", "file")
-
-        if not src_path.exists():
-            logger.warning("[Manager] channel file not found: %s", src_path)
-            continue
-
-        # Sanitize filename
-        safe_filename = Path(filename).name
-        if not safe_filename or safe_filename in {".", ".."}:
-            logger.warning("[Manager] skipping file with unsafe filename: %s", filename)
-            continue
-
-        dest_path = uploads_dir / safe_filename
-        src_hash = None  # Compute hash only when needed
-
-        # Check if file with same name exists
-        if dest_path.exists():
-            # Compare hash to determine if content is the same
-            src_hash = _compute_file_hash(src_path)
-            dest_hash = _compute_file_hash(dest_path)
-
-            if src_hash == dest_hash:
-                # Same content, reuse existing file
-                file_size = dest_path.stat().st_size
-                logger.info(
-                    "[Manager] reusing existing file with same hash: %s (hash=%s...)",
-                    safe_filename,
-                    src_hash[:8],
-                )
-                # Clean up temporary file
-                try:
-                    src_path.unlink()
-                except Exception:
-                    pass
-            else:
-                # Different content, find a new filename with counter
-                base = dest_path.stem
-                suffix = dest_path.suffix
-                counter = 1
-                while dest_path.exists():
-                    dest_path = uploads_dir / f"{base}_{counter}{suffix}"
-                    counter += 1
-                safe_filename = dest_path.name
-
-                try:
-                    shutil.copy2(src_path, dest_path)
-                    file_size = dest_path.stat().st_size
-                    logger.info(
-                        "[Manager] copied channel file (different content): %s -> %s (%d bytes)",
-                        src_path.name,
-                        dest_path,
-                        file_size,
-                    )
-                    # Clean up temporary file
-                    try:
-                        src_path.unlink()
-                    except Exception:
-                        pass
-                except Exception as exc:
-                    logger.warning("[Manager] failed to copy channel file %s: %s", src_path, exc)
-                    continue
-        else:
-            # No existing file with same name, copy directly
-            try:
-                shutil.copy2(src_path, dest_path)
-                file_size = dest_path.stat().st_size
-                logger.info(
-                    "[Manager] copied channel file: %s -> %s (%d bytes)",
-                    src_path.name,
-                    dest_path,
-                    file_size,
-                )
-                # Clean up temporary file
-                try:
-                    src_path.unlink()
-                except Exception:
-                    pass
-            except Exception as exc:
-                logger.warning("[Manager] failed to copy channel file %s: %s", src_path, exc)
-                continue
-
-        # Build metadata compatible with UploadsMiddleware
-        processed_files.append({
-            "filename": safe_filename,
-            "size": file_size,
-            "path": f"/mnt/user-data/uploads/{safe_filename}",  # Virtual path for agent
-            "extension": Path(safe_filename).suffix,
-            "type": file_type,  # Preserve original type (image, video, audio, file)
-        })
-
-    return processed_files
 
 
 def _extract_response_text(result: dict | list) -> str:
@@ -232,6 +92,98 @@ def _extract_response_text(result: dict | list) -> str:
                 if text:
                     return text
     return ""
+
+
+def _extract_text_content(content: Any) -> str:
+    """Extract text from a streaming payload content field."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, Mapping):
+                text = block.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+                else:
+                    nested = block.get("content")
+                    if isinstance(nested, str):
+                        parts.append(nested)
+        return "".join(parts)
+    if isinstance(content, Mapping):
+        for key in ("text", "content"):
+            value = content.get(key)
+            if isinstance(value, str):
+                return value
+    return ""
+
+
+def _merge_stream_text(existing: str, chunk: str) -> str:
+    """Merge either delta text or cumulative text into a single snapshot."""
+    if not chunk:
+        return existing
+    if not existing or chunk == existing:
+        return chunk or existing
+    if chunk.startswith(existing):
+        return chunk
+    if existing.endswith(chunk):
+        return existing
+    return existing + chunk
+
+
+def _extract_stream_message_id(payload: Any, metadata: Any) -> str | None:
+    """Best-effort extraction of the streamed AI message identifier."""
+    candidates = [payload, metadata]
+    if isinstance(payload, Mapping):
+        candidates.append(payload.get("kwargs"))
+
+    for candidate in candidates:
+        if not isinstance(candidate, Mapping):
+            continue
+        for key in ("id", "message_id"):
+            value = candidate.get(key)
+            if isinstance(value, str) and value:
+                return value
+    return None
+
+
+def _accumulate_stream_text(
+    buffers: dict[str, str],
+    current_message_id: str | None,
+    event_data: Any,
+) -> tuple[str | None, str | None]:
+    """Convert a ``messages-tuple`` event into the latest displayable AI text."""
+    payload = event_data
+    metadata: Any = None
+    if isinstance(event_data, (list, tuple)):
+        if event_data:
+            payload = event_data[0]
+        if len(event_data) > 1:
+            metadata = event_data[1]
+
+    if isinstance(payload, str):
+        message_id = current_message_id or "__default__"
+        buffers[message_id] = _merge_stream_text(buffers.get(message_id, ""), payload)
+        return buffers[message_id], message_id
+
+    if not isinstance(payload, Mapping):
+        return None, current_message_id
+
+    payload_type = str(payload.get("type", "")).lower()
+    if "tool" in payload_type:
+        return None, current_message_id
+
+    text = _extract_text_content(payload.get("content"))
+    if not text and isinstance(payload.get("kwargs"), Mapping):
+        text = _extract_text_content(payload["kwargs"].get("content"))
+    if not text:
+        return None, current_message_id
+
+    message_id = _extract_stream_message_id(payload, metadata) or current_message_id or "__default__"
+    buffers[message_id] = _merge_stream_text(buffers.get(message_id, ""), text)
+    return buffers[message_id], message_id
 
 
 def _extract_artifacts(result: dict | list) -> list[str]:
@@ -290,7 +242,7 @@ def _resolve_attachments(thread_id: str, artifacts: list[str]) -> list[ResolvedA
     Skips artifacts that cannot be resolved (missing files, invalid paths)
     and logs warnings for them.
     """
-    from src.config.paths import get_paths
+    from deerflow.config.paths import get_paths
 
     attachments: list[ResolvedAttachment] = []
     paths = get_paths()
@@ -314,17 +266,46 @@ def _resolve_attachments(thread_id: str, artifacts: list[str]) -> list[ResolvedA
                 continue
             mime, _ = mimetypes.guess_type(str(actual))
             mime = mime or "application/octet-stream"
-            attachments.append(ResolvedAttachment(
-                virtual_path=virtual_path,
-                actual_path=actual,
-                filename=actual.name,
-                mime_type=mime,
-                size=actual.stat().st_size,
-                is_image=mime.startswith("image/"),
-            ))
+            attachments.append(
+                ResolvedAttachment(
+                    virtual_path=virtual_path,
+                    actual_path=actual,
+                    filename=actual.name,
+                    mime_type=mime,
+                    size=actual.stat().st_size,
+                    is_image=mime.startswith("image/"),
+                )
+            )
         except (ValueError, OSError) as exc:
             logger.warning("[Manager] failed to resolve artifact %s: %s", virtual_path, exc)
     return attachments
+
+
+def _prepare_artifact_delivery(
+    thread_id: str,
+    response_text: str,
+    artifacts: list[str],
+) -> tuple[str, list[ResolvedAttachment]]:
+    """Resolve attachments and append filename fallbacks to the text response."""
+    attachments: list[ResolvedAttachment] = []
+    if not artifacts:
+        return response_text, attachments
+
+    attachments = _resolve_attachments(thread_id, artifacts)
+    resolved_virtuals = {attachment.virtual_path for attachment in attachments}
+    unresolved = [path for path in artifacts if path not in resolved_virtuals]
+
+    if unresolved:
+        artifact_text = _format_artifact_text(unresolved)
+        response_text = (response_text + "\n\n" + artifact_text) if response_text else artifact_text
+
+    # Always include resolved attachment filenames as a text fallback so files
+    # remain discoverable even when the upload is skipped or fails.
+    if attachments:
+        resolved_text = _format_artifact_text([attachment.virtual_path for attachment in attachments])
+        response_text = (response_text + "\n\n" + resolved_text) if response_text else resolved_text
+
+    return response_text, attachments
 
 
 class ChannelManager:
@@ -346,7 +327,6 @@ class ChannelManager:
         assistant_id: str = DEFAULT_ASSISTANT_ID,
         default_session: dict[str, Any] | None = None,
         channel_sessions: dict[str, Any] | None = None,
-        streaming_channels: set[str] | None = None,
     ) -> None:
         self.bus = bus
         self.store = store
@@ -356,7 +336,6 @@ class ChannelManager:
         self._assistant_id = assistant_id
         self._default_session = _as_dict(default_session)
         self._channel_sessions = dict(channel_sessions or {})
-        self._streaming_channels = streaming_channels or {"matrix"}  # Channels that support message editing
         self._client = None  # lazy init — langgraph_sdk async client
         self._semaphore: asyncio.Semaphore | None = None
         self._running = False
@@ -371,12 +350,7 @@ class ChannelManager:
     def _resolve_run_params(self, msg: InboundMessage, thread_id: str) -> tuple[str, dict[str, Any], dict[str, Any]]:
         channel_layer, user_layer = self._resolve_session_layer(msg)
 
-        assistant_id = (
-            user_layer.get("assistant_id")
-            or channel_layer.get("assistant_id")
-            or self._default_session.get("assistant_id")
-            or self._assistant_id
-        )
+        assistant_id = user_layer.get("assistant_id") or channel_layer.get("assistant_id") or self._default_session.get("assistant_id") or self._assistant_id
         if not isinstance(assistant_id, str) or not assistant_id.strip():
             assistant_id = self._assistant_id
 
@@ -492,194 +466,37 @@ class ChannelManager:
         logger.info("[Manager] new thread created on LangGraph Server: thread_id=%s for chat_id=%s topic_id=%s", thread_id, msg.chat_id, msg.topic_id)
         return thread_id
 
-    def _supports_streaming(self, channel_name: str) -> bool:
-        """Check if a channel supports streaming (message editing)."""
-        return channel_name in self._streaming_channels
-
     async def _handle_chat(self, msg: InboundMessage) -> None:
-        """Route to streaming or blocking handler based on channel capability."""
-        if self._supports_streaming(msg.channel_name):
-            await self._handle_chat_streaming(msg)
-        else:
-            await self._handle_chat_blocking(msg)
-
-    async def _handle_chat_streaming(self, msg: InboundMessage) -> None:
-        """Handle chat with streaming response using runs.stream().
-
-        This method streams the response and updates the message in real-time
-        for channels that support message editing (like Matrix).
-        """
         client = self._get_client()
 
-        # Look up existing DeerFlow thread by topic_id (if present)
-        thread_id = None
-        if msg.topic_id:
-            thread_id = self.store.get_thread_id(msg.channel_name, msg.chat_id, topic_id=msg.topic_id)
-            if thread_id:
-                logger.info("[Manager] reusing thread: thread_id=%s for topic_id=%s", thread_id, msg.topic_id)
+        # Look up existing DeerFlow thread.
+        # topic_id may be None (e.g. Telegram private chats) — the store
+        # handles this by using the "channel:chat_id" key without a topic suffix.
+        thread_id = self.store.get_thread_id(msg.channel_name, msg.chat_id, topic_id=msg.topic_id)
+        if thread_id:
+            logger.info("[Manager] reusing thread: thread_id=%s for topic_id=%s", thread_id, msg.topic_id)
 
         # No existing thread found — create a new one
         if thread_id is None:
             thread_id = await self._create_thread(client, msg)
 
-        # Process channel file attachments (copy to uploads directory)
-        processed_files = _process_channel_files(thread_id, msg.files)
-        if processed_files:
-            logger.info("[Manager] processed %d file(s) from channel: %s", len(processed_files), [f["filename"] for f in processed_files])
-
         assistant_id, run_config, run_context = self._resolve_run_params(msg, thread_id)
-        logger.info("[Manager] invoking runs.stream(thread_id=%s, text=%r)", thread_id, msg.text[:100] if msg.text else "")
-
-        # Build message with file attachments if any
-        human_message: dict[str, Any] = {"role": "human", "content": msg.text}
-        if processed_files:
-            human_message["additional_kwargs"] = {"files": processed_files}
-
-        # Track streaming state
-        accumulated_text = ""
-        last_update_len = 0
-        message_id = None
-        update_count = 0
-        MIN_UPDATE_INTERVAL = 10  # Minimum characters between updates
-
-        try:
-            # Stream the response - use "messages" mode for token-by-token streaming
-            logger.info("[Manager] starting stream iteration...")
-            event_count = 0
-            async for event in client.runs.stream(
+        if msg.channel_name == "feishu":
+            await self._handle_streaming_chat(
+                client,
+                msg,
                 thread_id,
                 assistant_id,
-                input={"messages": [human_message]},
-                config=run_config,
-                context=run_context,
-                stream_mode=["messages"],
-            ):
-                event_count += 1
-                logger.info("[Manager] event #%d: event=%s, data_type=%s", event_count, event.event, type(event.data).__name__)
-                
-                # Handle messages/partial events (LangGraph SDK format)
-                if event.event == "messages/partial":
-                    # data is a list of message dicts with 'content' key
-                    if isinstance(event.data, list) and event.data:
-                        for msg_item in event.data:
-                            if isinstance(msg_item, dict):
-                                content = msg_item.get("content", "")
-                                if isinstance(content, str) and content:
-                                    accumulated_text = content  # Full content so far
-                                    
-                                    # Send update if enough new content
-                                    if len(accumulated_text) - last_update_len >= MIN_UPDATE_INTERVAL:
-                                        if message_id is None:
-                                            # Send initial message
-                                            outbound = OutboundMessage(
-                                                channel_name=msg.channel_name,
-                                                chat_id=msg.chat_id,
-                                                thread_id=thread_id,
-                                                text=accumulated_text,
-                                                is_final=False,
-                                                thread_ts=msg.thread_ts,
-                                            )
-                                            await self.bus.publish_outbound(outbound)
-                                            message_id = msg.chat_id
-                                            last_update_len = len(accumulated_text)
-                                            update_count += 1
-                                            logger.info("[Manager] sent initial message, len=%d", len(accumulated_text))
-                                        else:
-                                            # Send stream update
-                                            stream_msg = StreamUpdateMessage(
-                                                channel_name=msg.channel_name,
-                                                chat_id=msg.chat_id,
-                                                message_id=message_id,
-                                                text=accumulated_text,
-                                                is_final=False,
-                                                thread_ts=msg.thread_ts,
-                                            )
-                                            await self.bus.publish_stream_update(stream_msg)
-                                            last_update_len = len(accumulated_text)
-                                            update_count += 1
-                                    break  # Only process first message item
-
-                elif event.event == "messages/complete":
-                    # Final message complete
-                    if isinstance(event.data, list) and event.data:
-                        for msg_item in event.data:
-                            if isinstance(msg_item, dict):
-                                content = msg_item.get("content", "")
-                                if isinstance(content, str):
-                                    accumulated_text = content
-                                    break
-
-                elif event.event == "end":
-                    logger.info("[Manager] stream ended, accumulated_len=%d, updates=%d", len(accumulated_text), update_count)
-                    # Final update
-                    if accumulated_text:
-                        # If no updates were sent, send initial message first
-                        if message_id is None:
-                            outbound = OutboundMessage(
-                                channel_name=msg.channel_name,
-                                chat_id=msg.chat_id,
-                                thread_id=thread_id,
-                                text=accumulated_text,
-                                is_final=True,
-                                thread_ts=msg.thread_ts,
-                            )
-                            await self.bus.publish_outbound(outbound)
-                        else:
-                            # Send final stream update
-                            stream_msg = StreamUpdateMessage(
-                                channel_name=msg.channel_name,
-                                chat_id=msg.chat_id,
-                                message_id=message_id,
-                                text=accumulated_text,
-                                is_final=True,
-                                thread_ts=msg.thread_ts,
-                            )
-                            await self.bus.publish_stream_update(stream_msg)
-                    break
-
-            logger.info(
-                "[Manager] streaming completed: thread_id=%s, response_len=%d, updates=%d",
-                thread_id,
-                len(accumulated_text),
-                update_count,
+                run_config,
+                run_context,
             )
+            return
 
-        except Exception:
-            logger.exception("[Manager] streaming error, falling back to blocking")
-            # Fall back to blocking on error
-            await self._handle_chat_blocking(msg)
-
-    async def _handle_chat_blocking(self, msg: InboundMessage) -> None:
-        client = self._get_client()
-
-        # Look up existing DeerFlow thread by topic_id (if present)
-        thread_id = None
-        if msg.topic_id:
-            thread_id = self.store.get_thread_id(msg.channel_name, msg.chat_id, topic_id=msg.topic_id)
-            if thread_id:
-                logger.info("[Manager] reusing thread: thread_id=%s for topic_id=%s", thread_id, msg.topic_id)
-
-        # No existing thread found — create a new one
-        if thread_id is None:
-            thread_id = await self._create_thread(client, msg)
-
-        # Process channel file attachments (copy to uploads directory)
-        processed_files = _process_channel_files(thread_id, msg.files)
-        if processed_files:
-            logger.info("[Manager] processed %d file(s) from channel: %s", len(processed_files), [f["filename"] for f in processed_files])
-
-        assistant_id, run_config, run_context = self._resolve_run_params(msg, thread_id)
         logger.info("[Manager] invoking runs.wait(thread_id=%s, text=%r)", thread_id, msg.text[:100])
-
-        # Build message with file attachments if any
-        human_message: dict[str, Any] = {"role": "human", "content": msg.text}
-        if processed_files:
-            human_message["additional_kwargs"] = {"files": processed_files}
-
         result = await client.runs.wait(
             thread_id,
             assistant_id,
-            input={"messages": [human_message]},
+            input={"messages": [{"role": "human", "content": msg.text}]},
             config=run_config,
             context=run_context,
         )
@@ -694,20 +511,7 @@ class ChannelManager:
             len(artifacts),
         )
 
-        # Resolve artifact virtual paths to actual files for channel upload
-        attachments: list[ResolvedAttachment] = []
-        if artifacts:
-            attachments = _resolve_attachments(thread_id, artifacts)
-            resolved_virtuals = {a.virtual_path for a in attachments}
-            unresolved = [p for p in artifacts if p not in resolved_virtuals]
-            if unresolved:
-                artifact_text = _format_artifact_text(unresolved)
-                response_text = (response_text + "\n\n" + artifact_text) if response_text else artifact_text
-            # Always include resolved attachment filenames as a text fallback so
-            # files remain discoverable even when the upload is skipped or fails.
-            if attachments:
-                resolved_text = _format_artifact_text([a.virtual_path for a in attachments])
-                response_text = (response_text + "\n\n" + resolved_text) if response_text else resolved_text
+        response_text, attachments = _prepare_artifact_delivery(thread_id, response_text, artifacts)
 
         if not response_text:
             if attachments:
@@ -726,6 +530,103 @@ class ChannelManager:
         )
         logger.info("[Manager] publishing outbound message to bus: channel=%s, chat_id=%s", msg.channel_name, msg.chat_id)
         await self.bus.publish_outbound(outbound)
+
+    async def _handle_streaming_chat(
+        self,
+        client,
+        msg: InboundMessage,
+        thread_id: str,
+        assistant_id: str,
+        run_config: dict[str, Any],
+        run_context: dict[str, Any],
+    ) -> None:
+        logger.info("[Manager] invoking runs.stream(thread_id=%s, text=%r)", thread_id, msg.text[:100])
+
+        last_values: dict[str, Any] | list | None = None
+        streamed_buffers: dict[str, str] = {}
+        current_message_id: str | None = None
+        latest_text = ""
+        last_published_text = ""
+        last_publish_at = 0.0
+        stream_error: BaseException | None = None
+
+        try:
+            async for chunk in client.runs.stream(
+                thread_id,
+                assistant_id,
+                input={"messages": [{"role": "human", "content": msg.text}]},
+                config=run_config,
+                context=run_context,
+                stream_mode=["messages-tuple", "values"],
+            ):
+                event = getattr(chunk, "event", "")
+                data = getattr(chunk, "data", None)
+
+                if event == "messages-tuple":
+                    accumulated_text, current_message_id = _accumulate_stream_text(streamed_buffers, current_message_id, data)
+                    if accumulated_text:
+                        latest_text = accumulated_text
+                elif event == "values" and isinstance(data, (dict, list)):
+                    last_values = data
+                    snapshot_text = _extract_response_text(data)
+                    if snapshot_text:
+                        latest_text = snapshot_text
+
+                if not latest_text or latest_text == last_published_text:
+                    continue
+
+                now = time.monotonic()
+                if last_published_text and now - last_publish_at < STREAM_UPDATE_MIN_INTERVAL_SECONDS:
+                    continue
+
+                await self.bus.publish_outbound(
+                    OutboundMessage(
+                        channel_name=msg.channel_name,
+                        chat_id=msg.chat_id,
+                        thread_id=thread_id,
+                        text=latest_text,
+                        is_final=False,
+                        thread_ts=msg.thread_ts,
+                    )
+                )
+                last_published_text = latest_text
+                last_publish_at = now
+        except Exception as exc:
+            stream_error = exc
+            logger.exception("[Manager] streaming error: thread_id=%s", thread_id)
+        finally:
+            result = last_values if last_values is not None else {"messages": [{"type": "ai", "content": latest_text}]}
+            response_text = _extract_response_text(result)
+            artifacts = _extract_artifacts(result)
+            response_text, attachments = _prepare_artifact_delivery(thread_id, response_text, artifacts)
+
+            if not response_text:
+                if attachments:
+                    response_text = _format_artifact_text([attachment.virtual_path for attachment in attachments])
+                elif stream_error:
+                    response_text = "An error occurred while processing your request. Please try again."
+                else:
+                    response_text = latest_text or "(No response from agent)"
+
+            logger.info(
+                "[Manager] streaming response completed: thread_id=%s, response_len=%d, artifacts=%d, error=%s",
+                thread_id,
+                len(response_text),
+                len(artifacts),
+                stream_error,
+            )
+            await self.bus.publish_outbound(
+                OutboundMessage(
+                    channel_name=msg.channel_name,
+                    chat_id=msg.chat_id,
+                    thread_id=thread_id,
+                    text=response_text,
+                    artifacts=artifacts,
+                    attachments=attachments,
+                    is_final=True,
+                    thread_ts=msg.thread_ts,
+                )
+            )
 
     # -- command handling --------------------------------------------------
 
