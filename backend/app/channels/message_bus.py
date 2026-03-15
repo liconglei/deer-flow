@@ -89,6 +89,7 @@ class OutboundMessage:
         thread_id: DeerFlow thread ID that produced this response.
         text: The response text.
         artifacts: List of artifact paths produced by the agent.
+        tool_history: List of tool call history items for display.
         is_final: Whether this is the final message in the response stream.
         message_id: Platform-specific message ID (for editing in streaming).
         thread_ts: Optional platform thread identifier for threaded replies.
@@ -102,6 +103,7 @@ class OutboundMessage:
     text: str
     artifacts: list[str] = field(default_factory=list)
     attachments: list[ResolvedAttachment] = field(default_factory=list)
+    tool_history: list[dict[str, Any]] = field(default_factory=list)
     is_final: bool = True
     message_id: str | None = None  # For streaming: platform message ID to edit
     thread_ts: str | None = None

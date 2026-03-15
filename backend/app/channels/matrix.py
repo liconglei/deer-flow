@@ -228,11 +228,12 @@ class MatrixChannel(Channel):
             return
 
         logger.info(
-            "[Matrix] sending reply: room_id=%s, text_len=%d, thread_ts=%s, is_final=%s",
+            "[Matrix] sending reply: room_id=%s, text_len=%d, thread_ts=%s, is_final=%s, tool_history=%d",
             msg.chat_id,
             len(msg.text),
             msg.thread_ts,
             msg.is_final,
+            len(msg.tool_history),
         )
 
         try:
@@ -241,15 +242,18 @@ class MatrixChannel(Channel):
             # Check if we have a tracked event for this chat (streaming update)
             tracked_event_id = self._streaming_messages.get(msg.chat_id)
 
+            # Format message with tool history (only for final messages)
+            plain_text, html_body = self._format_message_with_tools(msg)
+
             if tracked_event_id and not msg.is_final:
                 # Streaming update: edit existing message
-                await self.edit_message(msg.chat_id, tracked_event_id, msg.text)
+                await self.edit_message_html(msg.chat_id, tracked_event_id, plain_text, html_body)
                 logger.debug("[Matrix] edited streaming message: chat=%s, event=%s", msg.chat_id, tracked_event_id)
                 return
 
             if tracked_event_id and msg.is_final:
                 # Final streaming update: edit and cleanup
-                await self.edit_message(msg.chat_id, tracked_event_id, msg.text)
+                await self.edit_message_html(msg.chat_id, tracked_event_id, plain_text, html_body)
                 await self._stop_typing(msg.chat_id)
                 if msg.thread_ts:
                     await self._send_reaction(msg.chat_id, msg.thread_ts, "✅")
@@ -263,9 +267,9 @@ class MatrixChannel(Channel):
             # Send message to room
             content = {
                 "msgtype": "m.text",
-                "body": msg.text,
+                "body": plain_text,
                 "format": "org.matrix.custom.html",
-                "formatted_body": self._markdown_to_html(msg.text),
+                "formatted_body": html_body,
             }
 
             # If replying to a specific message (thread_ts is the event_id)
@@ -667,252 +671,50 @@ class MatrixChannel(Channel):
             logger.exception("[Matrix] error downloading media: %s", mxc_uri)
             return None
 
+    def _format_message_with_tools(self, msg: OutboundMessage) -> tuple[str, str]:
+        """Format message with tool history for display.
+
+        Args:
+            msg: OutboundMessage with text and tool_history.
+
+        Returns:
+            Tuple of (plain_text, html_body) for Matrix display.
+            plain_text is markdown format, html_body is converted via _markdown_to_html.
+        """
+        from app.channels.formatters.tool_history import format_tool_history_markdown
+
+        if not msg.tool_history:
+            return msg.text, self._markdown_to_html(msg.text)
+
+        tool_section_md = format_tool_history_markdown(msg.tool_history)
+
+        if tool_section_md:
+            # Combine tool history (markdown) with response text
+            plain_text = f"{tool_section_md}\n\n{msg.text}"
+            html_body = self._markdown_to_html(plain_text)
+            return plain_text, html_body
+        return msg.text, self._markdown_to_html(msg.text)
+
     @staticmethod
     def _markdown_to_html(text: str) -> str:
         """Convert markdown to HTML for Matrix formatted messages.
 
-        Matrix supports a subset of HTML. This converts markdown formatting
-        to Matrix-compatible HTML tags.
-
-        Supported markdown:
-        - Headers: # ## ### #### ##### ######
-        - Bold: **text** or __text__
-        - Italic: *text* or _text_
-        - Strikethrough: ~~text~~
-        - Code blocks: ```lang\ncode```
-        - Inline code: `code`
-        - Links: [text](url)
-        - Unordered lists: - item or * item
-        - Ordered lists: 1. item
-        - Task lists: - [ ] item or - [x] item
-        - Blockquotes: > text
-        - Horizontal rules: --- or ***
-        - Tables: | col1 | col2 |
+        Uses the Python markdown library for robust conversion.
+        Matrix supports a subset of HTML tags.
         """
-        import re
+        import markdown
 
-        lines = text.split("\n")
-        result_lines = []
-        in_code_block = False
-        code_block_lang = ""
-        code_block_content = []
-        in_list = False
-        list_type = None  # "ul" or "ol"
-        in_blockquote = False
-        in_table = False
-        table_rows = []
-
-        def escape_html(s: str) -> str:
-            """Escape HTML entities."""
-            return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
-        i = 0
-        while i < len(lines):
-            line = lines[i]
-
-            # Code blocks (handle first, as they contain raw content)
-            if line.strip().startswith("```"):
-                if not in_code_block:
-                    in_code_block = True
-                    code_block_lang = line.strip()[3:].strip()
-                    code_block_content = []
-                else:
-                    # End code block - escape and output
-                    code_html = escape_html("\n".join(code_block_content))
-                    if code_block_lang:
-                        result_lines.append(f"<pre><code class='{code_block_lang}'>{code_html}</code></pre>")
-                    else:
-                        result_lines.append(f"<pre><code>{code_html}</code></pre>")
-                    in_code_block = False
-                    code_block_lang = ""
-                    code_block_content = []
-                i += 1
-                continue
-
-            if in_code_block:
-                code_block_content.append(line)
-                i += 1
-                continue
-
-            # Close list if needed
-            if in_list and not (line.strip().startswith(("-", "*", "+")) or re.match(r"^(\s*)[-*+]\s+\[", line) or re.match(r"^\d+\.\s", line.strip())):
-                result_lines.append("</ul>" if list_type == "ul" else "</ol>")
-                in_list = False
-                list_type = None
-
-            # Close blockquote if needed
-            if in_blockquote and not line.strip().startswith(">"):
-                result_lines.append("</blockquote>")
-                in_blockquote = False
-
-            # Close table if needed
-            if in_table and not line.strip().startswith("|"):
-                if table_rows:
-                    result_lines.append("<table>")
-                    for idx, row in enumerate(table_rows):
-                        cells = [MatrixChannel._format_inline_md(escape_html(c.strip())) for c in row.split("|")[1:-1]]
-                        if idx == 0:
-                            result_lines.append("<thead><tr>")
-                            for cell in cells:
-                                result_lines.append(f"<th>{cell}</th>")
-                            result_lines.append("</tr></thead><tbody>")
-                        elif not re.match(r"^[\s\-:|]+$", row):  # Skip separator rows
-                            result_lines.append("<tr>")
-                            for cell in cells:
-                                result_lines.append(f"<td>{cell}</td>")
-                            result_lines.append("</tr>")
-                    result_lines.append("</tbody></table>")
-                table_rows = []
-                in_table = False
-
-            # Empty line
-            if not line.strip():
-                i += 1
-                continue
-
-            # Horizontal rules
-            if re.match(r"^(-{3,}|\*{3,}|_{3,})$", line.strip()):
-                result_lines.append("<hr>")
-                i += 1
-                continue
-
-            # Headers
-            header_match = re.match(r"^(#{1,6})\s+(.+)$", line)
-            if header_match:
-                level = len(header_match.group(1))
-                content = MatrixChannel._format_inline_md(escape_html(header_match.group(2)))
-                result_lines.append(f"<h{level}>{content}</h{level}>")
-                i += 1
-                continue
-
-            # Blockquotes
-            if line.strip().startswith(">"):
-                if not in_blockquote:
-                    result_lines.append("<blockquote>")
-                    in_blockquote = True
-                quote_content = line.strip()[1:].strip()
-                result_lines.append(MatrixChannel._format_inline_md(escape_html(quote_content)))
-                i += 1
-                continue
-
-            # Tables
-            if line.strip().startswith("|"):
-                if not in_table:
-                    in_table = True
-                    table_rows = []
-                table_rows.append(line)
-                i += 1
-                continue
-
-            # Unordered lists (including task lists)
-            ul_match = re.match(r"^(\s*)[-*+]\s+(.*)$", line)
-            if ul_match:
-                if not in_list or list_type != "ul":
-                    if in_list:
-                        result_lines.append("</ol>" if list_type == "ol" else "</ul>")
-                    result_lines.append("<ul>")
-                    in_list = True
-                    list_type = "ul"
-                item_content = ul_match.group(2)
-                # Task list
-                task_match = re.match(r"^\[([ xX])\]\s*(.*)$", item_content)
-                if task_match:
-                    checked = task_match.group(1).lower() == "x"
-                    checkbox = "✅ " if checked else "⬜ "
-                    item_content = checkbox + MatrixChannel._format_inline_md(escape_html(task_match.group(2)))
-                else:
-                    item_content = MatrixChannel._format_inline_md(escape_html(item_content))
-                result_lines.append(f"<li>{item_content}</li>")
-                i += 1
-                continue
-
-            # Ordered lists
-            ol_match = re.match(r"^(\s*)\d+\.\s+(.*)$", line)
-            if ol_match:
-                if not in_list or list_type != "ol":
-                    if in_list:
-                        result_lines.append("</ul>" if list_type == "ul" else "</ol>")
-                    result_lines.append("<ol>")
-                    in_list = True
-                    list_type = "ol"
-                item_content = MatrixChannel._format_inline_md(escape_html(ol_match.group(2)))
-                result_lines.append(f"<li>{item_content}</li>")
-                i += 1
-                continue
-
-            # Regular paragraph
-            result_lines.append(f"<p>{MatrixChannel._format_inline_md(escape_html(line))}</p>")
-            i += 1
-
-        # Close any open tags
-        if in_code_block:
-            code_html = escape_html("\n".join(code_block_content))
-            result_lines.append(f"<pre><code>{code_html}</code></pre>")
-        if in_list:
-            result_lines.append("</ul>" if list_type == "ul" else "</ol>")
-        if in_blockquote:
-            result_lines.append("</blockquote>")
-        if in_table and table_rows:
-            result_lines.append("<table>")
-            for idx, row in enumerate(table_rows):
-                cells = [MatrixChannel._format_inline_md(escape_html(c.strip())) for c in row.split("|")[1:-1]]
-                if idx == 0:
-                    result_lines.append("<thead><tr>")
-                    for cell in cells:
-                        result_lines.append(f"<th>{cell}</th>")
-                    result_lines.append("</tr></thead><tbody>")
-                elif not re.match(r"^[\s\-:|]+$", row):
-                    result_lines.append("<tr>")
-                    for cell in cells:
-                        result_lines.append(f"<td>{cell}</td>")
-                    result_lines.append("</tr>")
-            result_lines.append("</tbody></table>")
-
-        return "\n".join(result_lines)
-
-    @staticmethod
-    def _format_inline_md(text: str) -> str:
-        """Format inline markdown elements (bold, italic, code, links, strikethrough).
-
-        Note: text should already be HTML-escaped before calling this.
-        """
-        import re
-
-        # Inline code - use special markers to avoid double processing
-        # Since text is already escaped, we look for backticks directly
-        parts = []
-        last_end = 0
-        for match in re.finditer(r"`([^`]+)`", text):
-            # Add text before code
-            parts.append(text[last_end:match.start()])
-            # Add code (content is already escaped)
-            parts.append(f"<code>{match.group(1)}</code>")
-            last_end = match.end()
-        parts.append(text[last_end:])
-        text = "".join(parts)
-
-        # Bold: **text** or __text__
-        text = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", text)
-        text = re.sub(r"__([^_]+)__", r"<strong>\1</strong>", text)
-
-        # Italic: *text* or _text_ (must come after bold)
-        text = re.sub(r"\*([^*]+)\*", r"<em>\1</em>", text)
-        text = re.sub(r"_([^_]+)_", r"<em>\1</em>", text)
-
-        # Strikethrough: ~~text~~
-        text = re.sub(r"~~([^~]+)~~", r"<del>\1</del>", text)
-
-        # Links: [text](url) - URL needs to be unescaped for href
-        def replace_link(m):
-            link_text = m.group(1)
-            url = m.group(2)
-            # Unescape URL for href
-            url = url.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
-            return f'<a href="{url}">{link_text}</a>'
-
-        text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", replace_link, text)
-
-        return text
+        # Convert markdown to HTML
+        # extensions: tables, fenced_code blocks, newline to <br>
+        html = markdown.markdown(
+            text,
+            extensions=[
+                "tables",
+                "fenced_code",
+                "nl2br",
+            ]
+        )
+        return html
 
     # -- typing notification helpers ---------------------------------------
 
@@ -1119,6 +921,59 @@ class MatrixChannel(Channel):
 
         except Exception:
             logger.exception("[Matrix] error editing message")
+            return None
+
+    async def edit_message_html(self, room_id: str, event_id: str, plain_text: str, html_body: str) -> str | None:
+        """Edit a previously sent message with pre-formatted HTML.
+
+        Args:
+            room_id: The Matrix room ID.
+            event_id: The event ID of the message to edit.
+            plain_text: The plain text content.
+            html_body: The pre-formatted HTML content.
+
+        Returns:
+            The new event ID if successful, None otherwise.
+        """
+        if not self._client:
+            return None
+
+        try:
+            from nio import RoomSendResponse
+
+            content = {
+                "msgtype": "m.text",
+                "body": f"* {plain_text}",
+                "format": "org.matrix.custom.html",
+                "formatted_body": html_body,
+                "m.new_content": {
+                    "msgtype": "m.text",
+                    "body": plain_text,
+                    "format": "org.matrix.custom.html",
+                    "formatted_body": html_body,
+                },
+                "m.relates_to": {
+                    "rel_type": "m.replace",
+                    "event_id": event_id,
+                },
+            }
+
+            response = await self._client.room_send(
+                room_id=room_id,
+                message_type="m.room.message",
+                content=content,
+                ignore_unverified_devices=True,
+            )
+
+            if isinstance(response, RoomSendResponse):
+                logger.debug("[Matrix] message edited with HTML: %s -> %s", event_id, response.event_id)
+                return response.event_id
+            else:
+                logger.warning("[Matrix] failed to edit message: %s", response)
+                return None
+
+        except Exception:
+            logger.exception("[Matrix] error editing message with HTML")
             return None
 
     # -- streaming support --------------------------------------------------

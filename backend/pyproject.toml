@@ -17,6 +17,7 @@ dependencies = [
     "langgraph-sdk>=0.1.51",
     "markdown-to-mrkdwn>=0.3.1",
     "matrix-nio[e2e]>=0.24.0",
+    "markdown>=3.7",
 ]
 
 [dependency-groups]

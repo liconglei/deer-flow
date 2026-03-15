@@ -20,6 +20,7 @@ venv/
 
 # Environment variables
 .env
+.env.docker
 
 # Configuration files
 config.yaml

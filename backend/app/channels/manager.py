@@ -9,6 +9,7 @@ import time
 from collections.abc import Mapping
 from typing import Any
 
+from app.channels.formatters.tool_history import extract_tool_history
 from app.channels.message_bus import InboundMessage, InboundMessageType, MessageBus, OutboundMessage, ResolvedAttachment
 from app.channels.store import ChannelStore
 
@@ -548,6 +549,7 @@ class ChannelManager:
         latest_text = ""
         last_published_text = ""
         last_publish_at = 0.0
+        last_tool_history_count = 0  # Track tool history changes
         stream_error: BaseException | None = None
 
         try:
@@ -572,8 +574,16 @@ class ChannelManager:
                     if snapshot_text:
                         latest_text = snapshot_text
 
-                if not latest_text or latest_text == last_published_text:
+                # Publish on text change or new tool calls
+                streaming_tool_history = extract_tool_history(
+                    last_values.get("messages", []) if isinstance(last_values, dict) else []
+                )
+                tool_history_changed = len(streaming_tool_history) != last_tool_history_count
+                last_tool_history_count = len(streaming_tool_history)
+
+                if (not latest_text or latest_text == last_published_text) and not tool_history_changed:
                     continue
+                display_text = latest_text if latest_text else "..."
 
                 now = time.monotonic()
                 if last_published_text and now - last_publish_at < STREAM_UPDATE_MIN_INTERVAL_SECONDS:
@@ -584,7 +594,8 @@ class ChannelManager:
                         channel_name=msg.channel_name,
                         chat_id=msg.chat_id,
                         thread_id=thread_id,
-                        text=latest_text,
+                        text=display_text,
+                        tool_history=streaming_tool_history,
                         is_final=False,
                         thread_ts=msg.thread_ts,
                     )
@@ -600,6 +611,10 @@ class ChannelManager:
             artifacts = _extract_artifacts(result)
             response_text, attachments = _prepare_artifact_delivery(thread_id, response_text, artifacts)
 
+            tool_history = extract_tool_history(
+                result.get("messages", []) if isinstance(result, dict) else []
+            )
+
             if not response_text:
                 if attachments:
                     response_text = _format_artifact_text([attachment.virtual_path for attachment in attachments])
@@ -609,10 +624,11 @@ class ChannelManager:
                     response_text = latest_text or "(No response from agent)"
 
             logger.info(
-                "[Manager] streaming response completed: thread_id=%s, response_len=%d, artifacts=%d, error=%s",
+                "[Manager] streaming response completed: thread_id=%s, response_len=%d, artifacts=%d, tool_calls=%d, error=%s",
                 thread_id,
                 len(response_text),
                 len(artifacts),
+                len(tool_history),
                 stream_error,
             )
             await self.bus.publish_outbound(
@@ -623,6 +639,7 @@ class ChannelManager:
                     text=response_text,
                     artifacts=artifacts,
                     attachments=attachments,
+                    tool_history=tool_history,
                     is_final=True,
                     thread_ts=msg.thread_ts,
                 )
