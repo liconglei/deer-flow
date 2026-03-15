@@ -750,7 +750,7 @@ class MatrixChannel(Channel):
                 if table_rows:
                     result_lines.append("<table>")
                     for idx, row in enumerate(table_rows):
-                        cells = [escape_html(c.strip()) for c in row.split("|")[1:-1]]
+                        cells = [MatrixChannel._format_inline_md(escape_html(c.strip())) for c in row.split("|")[1:-1]]
                         if idx == 0:
                             result_lines.append("<thead><tr>")
                             for cell in cells:
@@ -855,7 +855,7 @@ class MatrixChannel(Channel):
         if in_table and table_rows:
             result_lines.append("<table>")
             for idx, row in enumerate(table_rows):
-                cells = [escape_html(c.strip()) for c in row.split("|")[1:-1]]
+                cells = [MatrixChannel._format_inline_md(escape_html(c.strip())) for c in row.split("|")[1:-1]]
                 if idx == 0:
                     result_lines.append("<thead><tr>")
                     for cell in cells:
