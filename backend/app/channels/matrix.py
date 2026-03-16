@@ -190,19 +190,52 @@ class MatrixChannel(Channel):
             raise
 
     async def _run_sync(self) -> None:
-        """Run the Matrix sync loop.
+        """Run the Matrix sync loop with automatic reconnection.
 
         Uses the next_batch token from initial sync to only receive new events.
+        On connection failure, waits and retries with exponential backoff.
         """
-        try:
-            # sync_forever will use the stored next_batch token,
-            # so it will only receive events after the initial sync
-            await self._client.sync_forever(timeout=30000)
-        except asyncio.CancelledError:
-            logger.info("[Matrix] sync loop cancelled")
-        except Exception:
-            if self._running:
-                logger.exception("[Matrix] sync error")
+        max_retries = 10
+        base_delay = 5  # seconds
+        sync_timeout = 30000  # ms
+
+        logger.info("[Matrix] starting sync loop")
+        while self._running:
+            try:
+                # sync_forever will use the stored next_batch token,
+                # so it will only receive events after the initial sync
+                await self._client.sync_forever(timeout=sync_timeout)
+            except asyncio.CancelledError:
+                logger.info("[Matrix] sync loop cancelled")
+                break
+            except Exception as exc:
+                if not self._running:
+                    break
+                # Exponential backoff with max delay of 60s
+                for attempt in range(max_retries):
+                    if not self._running:
+                        break
+                    delay = min(base_delay * (2 ** attempt), 60)
+                    logger.warning(
+                        "[Matrix] sync error, retrying in %ds (attempt %d/%d): %s",
+                        delay,
+                        attempt + 1,
+                        max_retries,
+                        exc,
+                    )
+                    await asyncio.sleep(delay)
+                    try:
+                        # Try to reconnect with a fresh sync
+                        await self._client.sync(timeout=sync_timeout)
+                        logger.info("[Matrix] reconnected successfully")
+                        break  # Reconnected, exit retry loop
+                    except Exception as retry_exc:
+                        exc = retry_exc
+                        if attempt == max_retries - 1:
+                            logger.error("[Matrix] failed to reconnect after %d attempts", max_retries)
+                else:
+                    # All retries exhausted, wait before next outer loop iteration
+                    await asyncio.sleep(60)
 
     async def stop(self) -> None:
         self._running = False
@@ -423,7 +456,7 @@ class MatrixChannel(Channel):
 
         # Request the room key to try to decrypt future messages
         try:
-            await self._client.request_room_key(event.session_id, event.sender_key, room.room_id)
+            await self._client.request_room_key(event)
             logger.info("[Matrix] requested room key for session %s", event.session_id)
         except Exception:
             logger.exception("[Matrix] failed to request room key")

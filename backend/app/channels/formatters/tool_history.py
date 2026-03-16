@@ -144,20 +144,27 @@ def _extract_error_message(result_text: str, parsed: dict | None) -> str:
     return _truncate(result_text[:80], 80)
 
 
-def _format_detailed_result_md(name: str, result: str | dict | None, args: dict[str, Any] | None = None) -> list[str]:
-    """Format detailed result in markdown format."""
+def _format_detailed_result_md(name: str, result: str | dict | list | None, args: dict[str, Any] | None = None) -> list[str]:
+    """Format detailed result in markdown format.
+    
+    Uses tree-style indentation with vertical connectors (│) for
+    visual alignment under the tool title.
+    """
     if not result:
         return []
     lines = []
     args = args or {}
+    
+    # Parse result - handle string, dict, and list types
     parsed = None
-    if isinstance(result, dict):
+    if isinstance(result, (dict, list)):
         parsed = result
     elif isinstance(result, str):
         try:
             parsed = json.loads(result)
         except (json.JSONDecodeError, TypeError):
             pass
+    
     result_text = str(result) if result else ""
     is_error = (
         result_text.lower().startswith("error") or
@@ -166,46 +173,49 @@ def _format_detailed_result_md(name: str, result: str | dict | None, args: dict[
         (isinstance(parsed, dict) and parsed.get("error"))
     )
     
+    # Tree-style indentation prefix
+    prefix = "│  "
+    
     if name == "web_search":
         if is_error:
-            lines.append(f"   ❌ 搜索失败: {_extract_error_message(result_text, parsed)}")
+            lines.append(f"{prefix}❌ 搜索失败: {_extract_error_message(result_text, parsed)}")
         elif isinstance(parsed, list):
             count = len(parsed)
-            lines.append(f"   ✓ 找到 {count} 个结果")
+            lines.append(f"{prefix}└─ ✓ 找到 {count} 个结果")
             for idx, item in enumerate(parsed[:5]):
                 if isinstance(item, dict):
                     title = _truncate(item.get("title", "无标题"), 50)
                     url = item.get("url", "")
                     if url:
-                        lines.append(f"      {idx + 1}. [{title}]({url})")
+                        lines.append(f"{prefix}      {idx + 1}. [{title}]({url})")
                     else:
-                        lines.append(f"      {idx + 1}. {title}")
+                        lines.append(f"{prefix}      {idx + 1}. {title}")
             if count > 5:
-                lines.append(f"      ... 还有 {count - 5} 个结果")
+                lines.append(f"{prefix}      ... 还有 {count - 5} 个结果")
         else:
-            lines.append("   ✓ 搜索完成")
+            lines.append(f"{prefix}└─ ✓ 搜索完成")
     elif name in ("read_file", "write_file", "str_replace"):
         action = {"read_file": "读取", "write_file": "写入", "str_replace": "编辑"}[name]
         path = args.get("path", "")
         if is_error:
-            lines.append(f"   ❌ {action}失败: {_extract_error_message(result_text, parsed)}")
+            lines.append(f"{prefix}❌ {action}失败: {_extract_error_message(result_text, parsed)}")
         else:
-            lines.append(f"   ✓ {action}成功")
+            lines.append(f"{prefix}└─ ✓ {action}成功")
         if path:
-            lines.append(f"      文件: `{_truncate(path, 60)}`")
+            lines.append(f"{prefix}      文件: `{_truncate(path, 60)}`")
     elif name == "bash":
         if is_error:
-            lines.append(f"   ❌ 执行失败: {_extract_error_message(result_text, parsed)}")
+            lines.append(f"{prefix}❌ 执行失败: {_extract_error_message(result_text, parsed)}")
         else:
-            lines.append("   ✓ 执行成功")
+            lines.append(f"{prefix}└─ ✓ 执行成功")
         output = _truncate(result_text.replace("\n", " ").strip(), 80)
         if output and output != "Tool ran without output or errors":
-            lines.append(f"      输出: {output}")
+            lines.append(f"{prefix}      输出: {output}")
     else:
         if is_error:
-            lines.append(f"   ❌ 失败: {_extract_error_message(result_text, parsed)}")
+            lines.append(f"{prefix}❌ 失败: {_extract_error_message(result_text, parsed)}")
         else:
-            lines.append("   ✓ 完成")
+            lines.append(f"{prefix}└─ ✓ 完成")
     return lines
 
 
@@ -239,7 +249,7 @@ def format_tool_history_markdown(history: list[dict[str, Any]]) -> str:
         if result:
             lines.extend(_format_detailed_result_md(name, result, args))
         elif status == "pending":
-            lines.append("   ⏳ 执行中...")
+            lines.append("│  └─ ⏳ 执行中...")
         
         # Add blank line between tools
         if not is_last:
